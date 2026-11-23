@@ -1,0 +1,3873 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>相机档期排期管理</title>
+<!--
+  ============================================================================
+  相机档期排期管理工具 · 云端协同租赁版 v5.0
+  ----------------------------------------------------------------------------
+  v5.0 迭代（在 v4.0 基础上增量，未破坏任何原有能力）：
+    · 【核心 BUG 修复】占用区间改为「[领用起始日, +∞)」——只要没登记实际收回日期，
+      该相机此后任何时段都不允许再排期，彻底堵住「逾期未还仍能排新档期」的重复排期漏洞
+    · 双重强拦截：① 相机下拉按所选时段实时置灰冲突设备（标注「该时段已借出」，不可选中）
+                  ② 提交时二次强校验，冲突则红字展示占用人 + 占用区间并拒绝写入
+    · 新增档期结算：实收租金 / 退款金额 / 扣款金额 / 结算备注
+      在「登记收回」弹层中一次填完（提前归还会提示登记退款），无需二次编辑
+    · 档期列表新增「结算」列：已归还行展示实收金额，应收≠实收时标注差额
+    · 看板新增「累计实收租金」，与原「累计应收租金」分列统计
+  v4.0 迭代（在 v3.0 基础上增量，未破坏任何原有能力）：
+    · 占用状态强规则：未登记实际收回日期即持续「借出中」，逾期不自动释放
+    · 收回日期：默认今天、只限制不早于领用日、支持补登（取消「不能晚于今天」）、控件加宽
+    · 押金类型：正常收押 / 支付宝免押 / 无押金（免押自动记为已收取，无押金金额为 0）
+    · 档期列表全局搜索：使用人 / 相机型号 / 序列号模糊匹配 + 按日期查租期内档期
+    · 搜索与原有相机型号 / 档期状态筛选叠加生效
+  v3.0 迭代（在 v2.0 基础上增量，未破坏任何原有能力）：
+    · 档期时间冲突强校验（区间有交集即拒绝，已归还档期不参与）+ 表单实时可用性弱提示
+    · 租赁业务字段：押金金额 / 押金状态 / 证件抵押 / 证件号码（列表脱敏）/
+      应收租金 / 成本支出 / 档期备注
+    · 操作能力：档期删除（二次确认）、设备删除（有未完成档期则拦截）
+    · 看板新增：待收押金总额、累计租金收入
+    · 档期列表筛选（相机型号 / 档期状态），已归还行整体置灰，可展开租赁明细
+  技术栈：原生 HTML + CSS + JavaScript（单文件、无需构建、双击即可运行）
+  数据层：Supabase 云端数据库（PostgREST）为主存储 + localStorage 本地缓存降级
+          · 云端配置见脚本顶部【云端配置填写处】CLOUD_CONFIG，填 URL + anon key 即启用
+          · 未填写配置时自动退回纯本地模式，功能与 v1.0 完全一致
+  代码结构：
+    CLOUD_CONFIG 云端配置（唯一需要手工填写的地方）
+    CONFIG       全局配置（缓存键、枚举、可选值）
+    Utils        纯函数工具（ID、日期、转义、指纹）
+    Store        本地缓存层（localStorage，离线可用）
+    Cloud        云端适配层（Supabase REST 读写，唯一发起网络请求的地方）
+    Mapper       行映射层（JS 驼峰字段 ⇄ 数据库下划线字段）
+    Sync         同步引擎（拉取 / 推送队列 / 轮询监听 / 离线续传 / 状态标识）
+    Service      业务逻辑层（校验 + 数据变更，不含任何 DOM 操作）
+    View         渲染层（DOM 拼装与事件绑定）
+    App          启动与事件分发
+  扩展说明：文件中以 "EXT:" 开头的注释即为预留扩展位，按编号即可定位。
+  ============================================================================
+-->
+<style>
+  /* ======================= 设计变量 ======================= */
+  :root {
+    --bg: #f4f5f4;
+    --surface: #ffffff;
+    --surface-soft: #fafbfa;
+    --border: #e2e5e3;
+    --border-strong: #cfd4d1;
+    --text: #1b1f1d;
+    --text-soft: #5b6560;
+    --text-mute: #8a938e;
+    --accent: #0f766e;
+    --accent-soft: #e6f2f0;
+    --danger: #b3261e;
+    --danger-soft: #fbeae8;
+    --warn: #a16207;
+    --warn-soft: #fdf3e0;
+    --ok: #15803d;
+    --ok-soft: #e9f5ec;
+    --radius: 10px;
+    --shadow: 0 1px 2px rgba(18, 32, 27, .04), 0 8px 24px -16px rgba(18, 32, 27, .22);
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+            "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Consolas, "Liberation Mono", monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body { margin: 0; padding: 0; }
+
+  body {
+    min-height: 100dvh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 14px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* 可见焦点环：键盘可达性 */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  /* ======================= 顶部导航 ======================= */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: rgba(255, 255, 255, .92);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .topbar-inner {
+    /* 档期表新增「结算」列后为 11 列，画布放宽到 1400 以便宽屏一屏铺满；
+       窄屏仍由 .table-wrap 内部横向滚动兜底 */
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 0 24px;
+    height: 64px;
+    display: flex;
+    align-items: center;
+    gap: 28px;
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding-right: 20px;
+    border-right: 1px solid var(--border);
+    flex: none;
+  }
+
+  .brand-mark {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    background: var(--accent);
+    display: grid;
+    place-items: center;
+    flex: none;
+  }
+
+  .brand-mark svg { display: block; }
+
+  .brand-text h1 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -.01em;
+    line-height: 1.2;
+  }
+
+  .brand-text p {
+    margin: 2px 0 0;
+    font-size: 11.5px;
+    color: var(--text-mute);
+    letter-spacing: .02em;
+  }
+
+  .tabs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: 100%;
+  }
+
+  .tab {
+    appearance: none;
+    border: 0;
+    background: transparent;
+    height: 100%;
+    padding: 0 14px;
+    font: inherit;
+    font-weight: 500;
+    color: var(--text-soft);
+    cursor: pointer;
+    position: relative;
+    transition: color .15s ease;
+  }
+
+  .tab:hover { color: var(--text); }
+
+  .tab[aria-selected="true"] { color: var(--accent); }
+
+  .tab[aria-selected="true"]::after {
+    content: "";
+    position: absolute;
+    left: 10px;
+    right: 10px;
+    bottom: -1px;
+    height: 2px;
+    background: var(--accent);
+    border-radius: 2px 2px 0 0;
+  }
+
+  .tab .count {
+    display: inline-block;
+    margin-left: 6px;
+    min-width: 18px;
+    padding: 0 5px;
+    height: 18px;
+    line-height: 18px;
+    font-size: 11px;
+    font-family: var(--mono);
+    text-align: center;
+    border-radius: 9px;
+    background: var(--surface-soft);
+    border: 1px solid var(--border);
+    color: var(--text-soft);
+  }
+
+  .tab[aria-selected="true"] .count {
+    background: var(--accent-soft);
+    border-color: #cde5e0;
+    color: var(--accent);
+  }
+
+  /* ---- 云端同步状态标识（仅页面角落的微小指示，不改变原有视觉） ---- */
+  .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #9aa39e;
+    box-shadow: 0 0 0 3px #f0f2f1;
+    transition: background .2s ease, box-shadow .2s ease;
+    flex: none;
+  }
+
+  .dot.is-online  { background: var(--ok);     box-shadow: 0 0 0 3px var(--ok-soft); }
+  .dot.is-local   { background: #9aa39e;       box-shadow: 0 0 0 3px #f0f2f1; }
+  .dot.is-syncing { background: #b58900;       box-shadow: 0 0 0 3px #fdf3e0; }
+  .dot.is-offline { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
+
+  .cloud-status {
+    margin-left: auto;
+    margin-right: -6px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 6px;
+    background: none;
+    border: 0;
+    border-radius: 6px;
+    font: inherit;
+    font-size: 12px;
+    color: var(--text-mute);
+    cursor: pointer;
+    transition: color .15s ease, background .15s ease;
+  }
+
+  .cloud-status:hover { color: var(--text); background: #f2f4f3; }
+  .cloud-status[data-state="offline"] { color: var(--danger); }
+  .cloud-status[data-state="connecting"] .dot { animation: dot-pulse 1.4s ease-in-out infinite; }
+
+  @keyframes dot-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: .35; }
+  }
+
+  /* ======================= 主内容区 ======================= */
+  main {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 24px 24px 64px;
+  }
+
+  .stats {
+    display: grid;
+    /* 指标卡从 6 个扩到 7 个（新增「累计实收租金」）：用 auto-fit 自适应换行，
+       1280px 宽屏恰好一行 7 列，窄屏自动收成 4 / 3 / 2 列 */
+    grid-template-columns: repeat(auto-fit, minmax(158px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+
+  .stat {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    box-shadow: var(--shadow);
+  }
+
+  .stat-label {
+    font-size: 12px;
+    color: var(--text-mute);
+    letter-spacing: .02em;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .stat-value {
+    margin-top: 6px;
+    font-size: 26px;
+    font-weight: 600;
+    font-family: var(--mono);
+    letter-spacing: -.02em;
+    line-height: 1.1;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .stat-value.is-warn { color: var(--danger); }
+  .stat-value.is-money { font-size: 20px; letter-spacing: -.03em; }
+
+  /* ---- 档期筛选栏 ---- */
+  .filter-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 8px 18px 10px;
+  }
+
+  .filter-bar .select {
+    width: auto;
+    min-width: 138px;
+    height: 32px;
+    font-size: 13px;
+  }
+
+  /* 搜索框 + 日期筛选（与下拉同高，横向排布） */
+  .filter-bar .input {
+    width: 232px;
+    height: 32px;
+    font-size: 13px;
+  }
+
+  .filter-bar .input[type="date"] { width: 152px; }
+
+  @media (max-width: 720px) {
+    .filter-bar .input,
+    .filter-bar .input[type="date"],
+    .filter-bar .select { width: 100%; min-width: 0; }
+    .filter-count { margin-left: 0; }
+  }
+
+  .filter-label {
+    font-size: 12px;
+    color: var(--text-mute);
+    letter-spacing: .02em;
+  }
+
+  .filter-count {
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--text-mute);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ---- 多行备注 ---- */
+  .textarea {
+    width: 100%;
+    min-height: 74px;
+    padding: 8px 10px;
+    font: inherit;
+    font-size: 13.5px;
+    line-height: 1.5;
+    color: var(--text);
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 7px;
+    resize: vertical;
+    transition: border-color .15s ease, box-shadow .15s ease;
+  }
+
+  .textarea::placeholder { color: #a8b0ac; }
+  .textarea:hover { border-color: #b9c0bc; }
+  .textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(15, 118, 110, .12);
+  }
+
+  .field-full { grid-column: 1 / -1; }
+
+  /* ---- 表单分组标题 ---- */
+  .form-divider {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 6px 0 -4px;
+    font-size: 12px;
+    color: var(--text-mute);
+    letter-spacing: .02em;
+  }
+
+  .form-divider::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  /* ---- 冲突 / 可用性弱提示 ---- */
+  .form-hint {
+    margin: 10px 0 0;
+    min-height: 18px;
+    font-size: 12.5px;
+    color: var(--text-mute);
+  }
+
+  .form-hint.is-error { color: var(--danger); }
+  .form-hint.is-ok { color: var(--ok); }
+
+  /* ---- 已归还档期整行置灰 ---- */
+  tbody tr.row-done td { color: var(--text-mute); background: #fbfcfb; }
+  tbody tr.row-done .cell-strong { color: var(--text-soft); }
+  tbody tr.row-done:hover td { background: #f7f9f8; }
+
+  /* ---- 行内操作区 ---- */
+  .row-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+  }
+
+  .btn-danger-ghost { color: var(--danger); border-color: #ecd6d3; }
+  .btn-danger-ghost:hover {
+    background: var(--danger-soft);
+    color: var(--danger);
+    border-color: #e2bcb8;
+  }
+
+  /* ---- 档期明细展开行 ---- */
+  .detail-row td {
+    background: var(--surface-soft);
+    padding: 0 14px 14px;
+    border-bottom: 1px solid #eef1ef;
+  }
+
+  .detail-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px 18px;
+    margin: 0;
+    padding: 12px 14px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+
+  .detail-item { min-width: 0; }
+
+  .detail-item dt {
+    font-size: 11.5px;
+    color: var(--text-mute);
+    margin-bottom: 2px;
+  }
+
+  .detail-item dd {
+    margin: 0;
+    font-size: 13px;
+    color: var(--text);
+    word-break: break-word;
+  }
+
+  .detail-item dd.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  .panel { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  /* grid 子项默认 min-width:auto，会被宽表格撑开、把整页顶出横向滚动条；
+     这里显式归零，让宽表格只在 .table-wrap 内部横向滚动 */
+  .panel > * { min-width: 0; }
+  .hidden { display: none !important; }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+  }
+
+  .card-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 16px 18px 0;
+  }
+
+  .card-head h2 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: -.005em;
+  }
+
+  .card-head .hint {
+    font-size: 12px;
+    color: var(--text-mute);
+  }
+
+  .card-body { padding: 14px 18px 18px; }
+
+  /* ======================= 表单 ======================= */
+  .form-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px 14px;
+    align-items: start;
+  }
+
+  .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+
+  .field label {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-soft);
+    letter-spacing: .01em;
+  }
+
+  .field label .req { color: var(--danger); margin-left: 2px; }
+
+  .input, .select {
+    appearance: none;
+    width: 100%;
+    height: 36px;
+    padding: 0 10px;
+    font: inherit;
+    font-size: 13.5px;
+    color: var(--text);
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 7px;
+    transition: border-color .15s ease, box-shadow .15s ease;
+  }
+
+  .input::placeholder { color: #a8b0ac; }
+
+  .input:hover, .select:hover { border-color: #b9c0bc; }
+
+  .input:focus, .select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(15, 118, 110, .12);
+  }
+
+  .input:disabled, .select:disabled {
+    background: var(--surface-soft);
+    color: var(--text-mute);
+    cursor: not-allowed;
+  }
+
+  .select {
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M3 4.5 6 7.5 9 4.5' fill='none' stroke='%235b6560' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+    padding-right: 28px;
+  }
+
+  .form-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px dashed var(--border);
+  }
+
+  .form-msg { font-size: 12px; color: var(--text-mute); }
+
+  .form-msg.is-error { color: var(--danger); }
+
+  /* ======================= 按钮 ======================= */
+  .btn {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 36px;
+    padding: 0 14px;
+    font: inherit;
+    font-size: 13.5px;
+    font-weight: 500;
+    color: #fff;
+    background: var(--accent);
+    border: 1px solid transparent;
+    border-radius: 7px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background .15s ease, transform .08s ease, border-color .15s ease, color .15s ease;
+  }
+
+  .btn:hover { background: #0c655e; }
+  .btn:active { transform: scale(.98); }
+
+  .btn-ghost {
+    background: var(--surface);
+    color: var(--text-soft);
+    border-color: var(--border-strong);
+  }
+
+  .btn-ghost:hover { background: var(--surface-soft); color: var(--text); border-color: #b9c0bc; }
+
+  .btn-sm { height: 28px; padding: 0 9px; font-size: 12px; border-radius: 6px; }
+
+  .btn-link {
+    background: none;
+    border: 0;
+    height: auto;
+    padding: 0;
+    color: var(--accent);
+    font-size: 12.5px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  .btn-link:hover { background: none; text-decoration: underline; }
+
+  /* ======================= 表格 ======================= */
+  .table-wrap { overflow-x: auto; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13.5px;
+  }
+
+  thead th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    text-align: left;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-soft);
+    letter-spacing: .02em;
+    background: var(--surface-soft);
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    padding: 9px 14px;
+    white-space: nowrap;
+  }
+
+  tbody td {
+    padding: 11px 14px;
+    border-bottom: 1px solid #f0f2f1;
+    vertical-align: middle;
+  }
+
+  tbody tr:hover { background: #fbfcfb; }
+  tbody tr:last-child td { border-bottom: 0; }
+
+  .cell-strong { font-weight: 500; }
+
+  .cell-sub {
+    display: block;
+    margin-top: 2px;
+    font-size: 11.5px;
+    color: var(--text-mute);
+  }
+
+  /* 结算差额：应收与实收不一致时用琥珀色提示，不抢走「逾期」红色的语义 */
+  .cell-sub.is-warn { color: var(--warn); }
+
+  .mono { font-family: var(--mono); font-size: 12.5px; letter-spacing: -.01em; }
+
+  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  .row-overdue td { background: #fdf8f7; }
+  .row-overdue:hover td { background: #fcf3f1; }
+
+  /* 档期表列较多（11 列）：给一个最小宽度并禁止逐字换行，宽屏一屏铺满、窄屏在
+     .table-wrap 内横向滚动，避免型号 / 序列号 / 日期被挤成一行只放一个字 */
+  .table-schedules { min-width: 1120px; font-size: 13px; }
+  .table-schedules th,
+  .table-schedules td { white-space: nowrap; padding: 10px 11px; }
+  /* 行内收回日期框在宽表里略收窄（仍有足够点击面积，原生选择器完整显示） */
+  .table-schedules .inline .input[type="date"] { width: 150px; min-width: 150px; }
+
+  .text-danger { color: var(--danger); }
+
+  /* ======================= 徽标 ======================= */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 22px;
+    padding: 0 8px;
+    border-radius: 11px;
+    font-size: 11.5px;
+    font-weight: 500;
+    white-space: nowrap;
+    border: 1px solid transparent;
+  }
+
+  .badge::before {
+    content: "";
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+
+  .badge.is-idle { color: var(--text-soft); background: #f2f4f3; border-color: var(--border); }
+  .badge.is-accent { color: var(--accent); background: var(--accent-soft); border-color: #cfe7e3; }
+  .badge.is-ok { color: var(--ok); background: var(--ok-soft); border-color: #cfe7d7; }
+  .badge.is-warn { color: var(--warn); background: var(--warn-soft); border-color: #f0e0bd; }
+  .badge.is-danger { color: var(--danger); background: var(--danger-soft); border-color: #f2d4d1; }
+
+  /* ======================= 行内操作 ======================= */
+  .inline {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: nowrap;
+  }
+
+  .inline .input { height: 32px; width: 130px; font-size: 12.5px; padding: 0 8px; border-radius: 6px; }
+
+  /* 实际收回日期：加宽选择框，点击区域更大（移动端友好） */
+  .inline .input[type="date"] {
+    width: 168px;
+    min-width: 168px;
+    padding: 0 6px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  @media (max-width: 720px) {
+    .inline .input[type="date"] { width: 100%; min-width: 152px; }
+  }
+
+  .muted { color: var(--text-mute); font-size: 12.5px; }
+
+  /* ======================= 空状态 ======================= */
+  .empty {
+    padding: 44px 16px;
+    text-align: center;
+  }
+
+  .empty-icon {
+    width: 40px;
+    height: 40px;
+    margin: 0 auto 10px;
+    border-radius: 10px;
+    display: grid;
+    place-items: center;
+    background: var(--surface-soft);
+    border: 1px solid var(--border);
+    color: var(--text-mute);
+  }
+
+  .empty h3 { margin: 0 0 4px; font-size: 13.5px; font-weight: 600; }
+  .empty p { margin: 0; font-size: 12.5px; color: var(--text-mute); }
+
+  /* ======================= Toast ======================= */
+  .toast-host {
+    position: fixed;
+    right: 20px;
+    bottom: 20px;
+    z-index: 60;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    pointer-events: none;
+  }
+
+  .toast {
+    min-width: 180px;
+    max-width: 320px;
+    padding: 10px 14px;
+    font-size: 13px;
+    color: #fff;
+    background: #1f2a26;
+    border-radius: 8px;
+    box-shadow: 0 10px 30px -12px rgba(18, 32, 27, .5);
+    animation: toast-in .18s cubic-bezier(.16, 1, .3, 1);
+  }
+
+  .toast.is-error { background: #8f2018; }
+
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  /* ======================= 弹层：登记收回 + 结算 ======================= */
+  .modal-host {
+    position: fixed;
+    inset: 0;
+    z-index: 80;
+    display: grid;
+    place-items: center;
+    padding: 20px;
+  }
+
+  .modal-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(18, 32, 27, .42);
+    animation: fade-in .16s ease;
+  }
+
+  .modal {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    max-width: 580px;
+    max-height: calc(100dvh - 40px);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 24px 64px -24px rgba(18, 32, 27, .48);
+    animation: modal-in .18s cubic-bezier(.16, 1, .3, 1);
+  }
+
+  .modal-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding: 18px 20px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .modal-head h2 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -.01em;
+  }
+
+  .modal-sub {
+    margin: 3px 0 0;
+    font-size: 12.5px;
+    color: var(--text-mute);
+  }
+
+  .modal-close {
+    appearance: none;
+    margin: -4px -6px 0 auto;
+    width: 30px;
+    height: 30px;
+    flex: none;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--text-mute);
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+    transition: background .15s ease, color .15s ease;
+  }
+
+  .modal-close:hover { background: #f2f4f3; color: var(--text); }
+
+  .modal-body {
+    padding: 16px 20px 4px;
+    overflow-y: auto;
+  }
+
+  .modal-foot {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 10px;
+    padding: 14px 20px 18px;
+    border-top: 1px dashed var(--border);
+  }
+
+  .modal-foot .form-msg {
+    margin-right: auto;
+    color: var(--danger);
+  }
+
+  /* 弹层顶部的档期速览（使用人 / 租期 / 应收 / 押金） */
+  .settle-summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+    gap: 8px 14px;
+    margin-bottom: 14px;
+    padding: 10px 12px;
+    background: var(--surface-soft);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+
+  .settle-summary dt {
+    font-size: 11px;
+    color: var(--text-mute);
+  }
+
+  .settle-summary dd {
+    margin: 1px 0 0;
+    font-size: 12.5px;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* 提前归还时高亮「退款金额」，引导记账 */
+  .field.is-guide label { color: var(--warn); }
+
+  .input.is-guide {
+    border-color: #e3c98d;
+    background: #fffdf7;
+  }
+
+  .hint-action {
+    margin-left: 6px;
+    font-size: 12.5px;
+    color: var(--accent);
+    background: none;
+    border: 0;
+    padding: 0;
+    font-family: var(--font);
+    cursor: pointer;
+    text-decoration: underline;
+  }
+
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+
+  @keyframes modal-in {
+    from { opacity: 0; transform: translateY(8px) scale(.985); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+  }
+
+  /* ======================= 响应式 ======================= */
+  @media (max-width: 900px) {
+    .topbar-inner { height: auto; flex-wrap: wrap; padding: 10px 16px; gap: 12px; }
+    .brand { border-right: 0; padding-right: 0; }
+    .tabs { width: 100%; height: 40px; border-top: 1px solid var(--border); }
+    .tab { height: 40px; padding: 0 10px; }
+    .tab .count { display: none; }
+    .cloud-status { display: none; }
+    main { padding: 16px 16px 48px; }
+    .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+  }
+
+  @media print {
+    .topbar, .form-card, .btn, .toast-host, .modal-host { display: none !important; }
+    body { background: #fff; }
+    .card { box-shadow: none; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ============================ 顶部导航 ============================ -->
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 8.5A2.5 2.5 0 0 1 5.5 6h1.7l1.2-1.6h6.2L15.8 6h2.7A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z"/>
+          <circle cx="12" cy="12.4" r="3.4"/>
+        </svg>
+      </span>
+      <div class="brand-text">
+        <h1>相机档期排期管理</h1>
+        <p>设备台账 · 领用档期</p>
+      </div>
+    </div>
+
+    <!-- EXT-1 视图扩展：新增模块时在此追加一个 tab 按钮，并在下方补一个 section.panel -->
+    <nav class="tabs" role="tablist" aria-label="主功能导航">
+      <button class="tab" role="tab" id="tab-cameras" aria-controls="panel-cameras"
+              aria-selected="true" data-tab="cameras">
+        设备管理<span class="count" id="count-cameras">0</span>
+      </button>
+      <button class="tab" role="tab" id="tab-schedules" aria-controls="panel-schedules"
+              aria-selected="false" data-tab="schedules">
+        档期管理<span class="count" id="count-schedules">0</span>
+      </button>
+    </nav>
+
+    <!-- 云端同步状态：页面角落的微小标识，点击可立即同步一次 -->
+    <button class="cloud-status" id="cloud-status" type="button"
+            data-state="local" title="点击立即从云端同步">
+      <span class="dot is-local" id="cloud-dot" aria-hidden="true"></span>
+      <span id="cloud-status-text" role="status">本地存储</span>
+    </button>
+  </div>
+</header>
+
+<main>
+  <!-- ============================ 指标概览 ============================ -->
+  <!-- EXT-2 指标扩展：需要新指标时，复制一个 .stat 区块并补充 View.renderStats() 的计算 -->
+  <section class="stats" aria-label="数据概览">
+    <div class="stat">
+      <div class="stat-label">相机设备总数</div>
+      <div class="stat-value" id="stat-cameras">0</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">当前在借设备</div>
+      <div class="stat-value" id="stat-busy">0</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">空闲设备</div>
+      <div class="stat-value" id="stat-idle">0</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">逾期未归还</div>
+      <div class="stat-value" id="stat-overdue">0</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">待收押金总额</div>
+      <div class="stat-value is-money" id="stat-deposit">¥0.00</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">累计应收租金</div>
+      <div class="stat-value is-money" id="stat-rent">¥0.00</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">累计实收租金</div>
+      <div class="stat-value is-money" id="stat-rent-actual">¥0.00</div>
+    </div>
+  </section>
+
+  <!-- ============================ 设备管理 ============================ -->
+  <section class="panel" id="panel-cameras" role="tabpanel" aria-labelledby="tab-cameras">
+
+    <div class="card form-card">
+      <div class="card-head">
+        <h2>新增相机设备</h2>
+        <span class="hint">机身序列号唯一，用于区分同型号机身</span>
+      </div>
+      <div class="card-body">
+        <form id="form-camera" novalidate>
+          <div class="form-grid">
+            <div class="field">
+              <label for="cam-model">相机型号<span class="req" aria-hidden="true">*</span></label>
+              <input class="input" id="cam-model" name="model" type="text"
+                     placeholder="如：Sony A7M4 / Canon R6 II" autocomplete="off" required />
+            </div>
+            <div class="field">
+              <label for="cam-serial">机身序列号<span class="req" aria-hidden="true">*</span></label>
+              <input class="input" id="cam-serial" name="serial" type="text"
+                     placeholder="如：A7M4-3F21-0917" autocomplete="off" required />
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn" type="submit">添加设备</button>
+            <span class="form-msg" id="msg-camera" role="status"></span>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>相机设备列表</h2>
+        <span class="hint" id="hint-cameras">共 0 台</span>
+      </div>
+      <div class="card-body" style="padding:12px 0 4px">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">相机型号</th>
+                <th scope="col">机身序列号</th>
+                <th scope="col">当前状态</th>
+                <th scope="col">关联档期</th>
+                <th scope="col">登记时间</th>
+                <th scope="col">操作</th>
+              </tr>
+            </thead>
+            <tbody id="tbody-cameras"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ 档期管理 ============================ -->
+  <section class="panel hidden" id="panel-schedules" role="tabpanel" aria-labelledby="tab-schedules">
+
+    <div class="card form-card">
+      <div class="card-head">
+        <h2>新增档期记录</h2>
+        <span class="hint" id="hint-schedule-form">选择相机并登记领用人与归还计划</span>
+      </div>
+      <div class="card-body">
+        <form id="form-schedule" novalidate>
+          <div class="form-grid">
+            <div class="field">
+              <label for="sch-camera">关联相机<span class="req" aria-hidden="true">*</span></label>
+              <select class="select" id="sch-camera" name="cameraId" required></select>
+            </div>
+            <div class="field">
+              <label for="sch-user">使用人员姓名<span class="req" aria-hidden="true">*</span></label>
+              <input class="input" id="sch-user" name="userName" type="text"
+                     placeholder="如：李文博" autocomplete="off" required />
+            </div>
+            <div class="field">
+              <label for="sch-start">领用起始日期<span class="req" aria-hidden="true">*</span></label>
+              <input class="input" id="sch-start" name="startDate" type="date" required />
+            </div>
+            <div class="field">
+              <label for="sch-due">预计归还日期<span class="req" aria-hidden="true">*</span></label>
+              <input class="input" id="sch-due" name="dueDate" type="date" required />
+            </div>
+            <div class="field">
+              <label for="sch-delivery">送达状态<span class="req" aria-hidden="true">*</span></label>
+              <select class="select" id="sch-delivery" name="deliveryStatus"></select>
+            </div>
+
+            <!-- 租赁业务字段（均可留空，金额支持两位小数）
+                 结算类金额（实收 / 退款 / 扣款）不在此处填写，统一在「登记收回」时录入 -->
+            <div class="form-divider"><span>租赁费用与备注（选填）· 实收 / 退款 / 扣款在登记收回时填写</span></div>
+
+            <div class="field">
+              <label for="sch-deposit-type">押金类型</label>
+              <select class="select" id="sch-deposit-type" name="depositType"></select>
+            </div>
+            <div class="field">
+              <label for="sch-deposit">押金金额（元）</label>
+              <input class="input" id="sch-deposit" name="depositAmount" type="number"
+                     step="0.01" min="0" inputmode="decimal" placeholder="0.00" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label for="sch-deposit-status">押金状态</label>
+              <select class="select" id="sch-deposit-status" name="depositStatus"></select>
+            </div>
+            <div class="field">
+              <label for="sch-idtype">证件抵押</label>
+              <select class="select" id="sch-idtype" name="idProofType"></select>
+            </div>
+            <div class="field">
+              <label for="sch-idnum">证件号码</label>
+              <input class="input" id="sch-idnum" name="idProofNumber" type="text"
+                     placeholder="选择证件类型后填写" autocomplete="off" maxlength="40" />
+            </div>
+            <div class="field">
+              <label for="sch-rent">应收租金（元）</label>
+              <input class="input" id="sch-rent" name="rentIncome" type="number"
+                     step="0.01" min="0" inputmode="decimal" placeholder="0.00" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label for="sch-cost">成本支出（元）</label>
+              <input class="input" id="sch-cost" name="costExpense" type="number"
+                     step="0.01" min="0" inputmode="decimal" placeholder="快递费、耗材等" autocomplete="off" />
+            </div>
+            <div class="field field-full">
+              <label for="sch-remark">档期备注</label>
+              <textarea class="textarea" id="sch-remark" name="remark" maxlength="200"
+                        placeholder="配件清单、特殊要求、寄回地址等补充信息"></textarea>
+            </div>
+          </div>
+
+          <!-- 冲突 / 可用性实时弱提示（红色=冲突，绿色=可租用） -->
+          <p class="form-hint" id="conflict-hint" role="status" aria-live="polite"></p>
+
+          <div class="form-actions">
+            <button class="btn" type="submit" id="btn-add-schedule">添加档期</button>
+            <span class="form-msg" id="msg-schedule" role="status"></span>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>档期记录列表</h2>
+        <span class="hint" id="hint-schedules">共 0 条</span>
+      </div>
+
+      <!-- 筛选栏：文本搜索（使用人 / 相机型号 / 序列号）+ 日期 + 相机型号 + 档期状态，可叠加生效 -->
+      <!-- EXT-11 筛选扩展：新增筛选项只需在 CONFIG.SCHEDULE_FILTERS 增加一条，渲染与过滤自动生效 -->
+      <div class="filter-bar">
+        <span class="filter-label">搜索</span>
+        <input class="input" id="filter-search" type="search" autocomplete="off"
+               placeholder="使用人 / 相机型号 / 机身序列号" aria-label="搜索使用人、相机型号或机身序列号" />
+        <span class="filter-label">租期含</span>
+        <input class="input" id="filter-date" type="date"
+               aria-label="按日期筛选：该天处于租期内的档期" title="筛选该日期处于租期内的档期" />
+        <select class="select" id="filter-camera" aria-label="按相机型号筛选"></select>
+        <select class="select" id="filter-status" aria-label="按档期状态筛选"></select>
+        <button class="btn btn-link" type="button" id="filter-reset">重置</button>
+        <span class="filter-count" id="filter-count"></span>
+      </div>
+
+      <div class="card-body" style="padding:0 0 4px">
+        <div class="table-wrap">
+          <table class="table-schedules">
+            <thead>
+              <tr>
+                <th scope="col">关联相机</th>
+                <th scope="col">使用人</th>
+                <th scope="col">领用起始</th>
+                <th scope="col">预计归还</th>
+                <th scope="col">档期状态</th>
+                <th scope="col">送达状态</th>
+                <th scope="col">押金</th>
+                <th scope="col">应收租金</th>
+                <th scope="col">结算</th>
+                <th scope="col">实际收回</th>
+                <th scope="col">操作</th>
+              </tr>
+            </thead>
+            <tbody id="tbody-schedules"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ======================= 弹层：登记收回 + 结算 ======================= -->
+<!-- 一次填完「收回日期 + 实收 / 退款 / 扣款 / 结算备注」，不需要事后再编辑一遍 -->
+<div class="modal-host hidden" id="modal-settle" role="dialog" aria-modal="true"
+     aria-labelledby="settle-title">
+  <div class="modal-backdrop" data-action="close-settle" aria-hidden="true"></div>
+
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h2 id="settle-title">登记收回</h2>
+        <p class="modal-sub" id="settle-sub"></p>
+      </div>
+      <button class="modal-close" type="button" data-action="close-settle" aria-label="关闭">×</button>
+    </div>
+
+    <form id="form-settle" novalidate>
+      <div class="modal-body">
+        <dl class="settle-summary" id="settle-summary"></dl>
+
+        <div class="form-grid">
+          <div class="field">
+            <label for="settle-date">实际收回日期<span class="req" aria-hidden="true">*</span></label>
+            <input class="input" id="settle-date" name="returnedDate" type="date" required />
+          </div>
+          <div class="field">
+            <label for="settle-actual">实收租金（元）</label>
+            <input class="input" id="settle-actual" name="actualRent" type="number"
+                   step="0.01" min="0" inputmode="decimal" placeholder="默认等于应收租金" autocomplete="off" />
+          </div>
+          <div class="field" id="field-refund">
+            <label for="settle-refund">退款金额（元）</label>
+            <input class="input" id="settle-refund" name="refundAmount" type="number"
+                   step="0.01" min="0" inputmode="decimal" placeholder="提前归还退还的费用" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label for="settle-deduct">扣款金额（元）</label>
+            <input class="input" id="settle-deduct" name="deductAmount" type="number"
+                   step="0.01" min="0" inputmode="decimal" placeholder="损坏、逾期等扣款" autocomplete="off" />
+          </div>
+          <div class="field field-full">
+            <label for="settle-remark">结算备注</label>
+            <textarea class="textarea" id="settle-remark" name="settlementRemark" maxlength="300"
+                      placeholder="提前归还原因、扣款明细、退款说明、配件归还情况等"></textarea>
+          </div>
+        </div>
+
+        <p class="form-hint" id="settle-hint" role="status" aria-live="polite"></p>
+      </div>
+
+      <div class="modal-foot">
+        <span class="form-msg" id="msg-settle" role="status"></span>
+        <button class="btn btn-ghost" type="button" data-action="close-settle">取消</button>
+        <button class="btn" type="submit">确认收回</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="toast-host" id="toast-host" aria-live="polite" aria-atomic="false"></div>
+
+<script>
+/* ############################################################################
+ * ############################################################################
+ *
+ *      ★ ★ ★   云 端 配 置 填 写 处   （只需改这一段）   ★ ★ ★
+ *
+ *  填写哪两项：
+ *    1. SUPABASE_URL      —— Supabase 项目 URL，形如 https://abcdefghijklmn.supabase.co
+ *    2. SUPABASE_ANON_KEY —— 项目 Settings → API 里的 anon / public 密钥（很长的一串 JWT）
+ *
+ *  填好后：所有打开本文件的成员（填同一组配置）即共享同一份数据，多端自动同步。
+ *  两项留空：页面自动退回纯本地模式，功能不受影响，数据只存在本机浏览器。
+ *
+ *  ⚠ 注意：anon key 会出现在网页源码里，属于「团队共享密钥」用法，
+ *     请务必按文件末尾的建表 SQL 开启仅允许本表读写的 RLS 策略，
+ *     不要把 service_role 密钥填在这里，也不要把此文件公开发布到互联网。
+ *
+ *  建表 SQL / 获取密钥的步骤见本文件末尾「附：Supabase 极简接入说明」。
+ * ############################################################################
+ * ##########################################################################*/
+const CLOUD_CONFIG = {
+  /* ↓↓↓ 在这里填写 ↓↓↓ */
+  SUPABASE_URL: 'https://asheyrtvgbcxzxawwako.supabase.co',
+  SUPABASE_ANON_KEY: 'sb_publishable_brwNynWDZhaDevOlQnIs7g_LK9lGVxb',
+
+  /* ↓↓↓ 一般无需改动，按需微调 ↓↓↓ */
+  TABLES: {
+    cameras: 'cameras',      // 设备表名（与建表 SQL 保持一致）
+    schedules: 'schedules'   // 档期表名
+  },
+
+  // 轮询间隔（毫秒）：其他成员改动后，本页最多这么久就会自动刷新视图
+  POLL_MS: 4000,
+
+  // 本地改动合并推送的防抖时间（毫秒）
+  PUSH_DEBOUNCE_MS: 300,
+
+  // 单次请求超时（毫秒），超时即视为离线，转本地缓存
+  REQUEST_TIMEOUT_MS: 8000,
+
+  // 首次接入时若云端为空且本地已有数据，是否自动把本地存量上传到云端
+  ADOPT_LOCAL_ON_EMPTY_CLOUD: true
+};
+
+/* ============================================================================
+ * 2. CONFIG —— 全局配置
+ * ==========================================================================*/
+const CONFIG = {
+  // EXT-3 存储扩展：更换 key 即可启动一套全新数据；接入后端时保留 key 作本地缓存
+  STORAGE_KEY: 'camera-schedule:v1',
+  // 离线待推送队列的缓存键（网络恢复后据此续传）
+  QUEUE_KEY: 'camera-schedule:queue:v1',
+  // EXT-4 数据版本：v3 → v4 新增「结算类字段」，读取旧缓存时自动补默认值
+  DATA_VERSION: 4,
+
+  // 结算备注长度上限（多行文本）
+  SETTLE_REMARK_MAX: 300,
+
+  // 送达状态枚举 —— 如需增加状态（如「运输中」「已签收」），在此追加即可
+  DELIVERY_STATUS: ['未送达', '已送达'],
+
+  /**
+   * 押金类型枚举（默认取第 1 项「正常收押」）
+   *   正常收押   —— 常规收取押金，金额与状态都由人工选择
+   *   支付宝免押 —— 走平台免押授权：金额可填 0 或授权额度，状态自动置为「已收取」
+   *   无押金     —— 不收押金：金额强制为 0，不计入「待收押金总额」
+   */
+  DEPOSIT_TYPES: ['正常收押', '支付宝免押', '无押金'],
+
+  // 押金状态枚举（默认取第 1 项「未收取」）
+  DEPOSIT_STATUS: ['未收取', '已收取', '已退还'],
+
+  // 证件抵押类型枚举（默认取第 1 项「无抵押」）
+  ID_PROOF_TYPES: ['无抵押', '身份证', '学生证', '其他证件'],
+
+  // EXT-11 筛选扩展：新增筛选项只需追加一条 { value, label }，渲染与过滤自动生效
+  SCHEDULE_FILTERS: [
+    { value: '',         label: '全部状态' },
+    { value: 'upcoming', label: '待开始' },
+    { value: 'inUse',    label: '使用中' },
+    { value: 'overdue',  label: '已逾期' },
+    { value: 'returned', label: '已归还' }
+  ],
+
+  // 档期状态枚举（派生状态，由 Service.scheduleState 计算，不入库）
+  // key 用于筛选项匹配，label / tone 用于列表徽标
+  SCHEDULE_STATE: {
+    upcoming: { key: 'upcoming', label: '待开始', tone: 'is-idle' },
+    pending:  { key: 'pending',  label: '待送达', tone: 'is-warn' },
+    inUse:    { key: 'inUse',    label: '使用中', tone: 'is-accent' },
+    returned: { key: 'returned', label: '已归还', tone: 'is-idle' },
+    overdue:  { key: 'overdue',  label: '已逾期', tone: 'is-danger' },
+    finished: { key: 'finished', label: '已归还', tone: 'is-ok' }
+  }
+};
+
+/* ============================================================================
+ * 3. Utils —— 纯函数工具
+ * ==========================================================================*/
+const Utils = {
+  /** 生成带前缀的唯一 ID */
+  uid(prefix) {
+    return prefix + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  },
+
+  /** 本地时区的今天，格式 YYYY-MM-DD（避免 toISOString 的 UTC 偏移问题） */
+  today() {
+    const d = new Date();
+    const p = n => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+  },
+
+  /** 日期偏移，返回 YYYY-MM-DD */
+  addDays(iso, days) {
+    const d = new Date(iso + 'T00:00:00');
+    d.setDate(d.getDate() + days);
+    const p = n => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+  },
+
+  /** 距今天的天数（正数=未来，负数=已过期） */
+  daysFromToday(iso) {
+    const a = new Date(iso + 'T00:00:00').getTime();
+    const b = new Date(Utils.today() + 'T00:00:00').getTime();
+    return Math.round((a - b) / 86400000);
+  },
+
+  /** 时间戳 → 本地日期 YYYY-MM-DD（不受时区影响） */
+  dateFromTs(ts) {
+    const d = new Date(ts);
+    const p = n => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+  },
+
+  /** 输出 2026-11-16 → 11-16；跨年则保留年份 */
+  shortDate(iso) {
+    if (!iso) return '';
+    const year = Utils.today().slice(0, 4);
+    return iso.slice(5, 7) + '-' + iso.slice(8, 10) + (iso.slice(0, 4) === year ? '' : ' ' + iso.slice(0, 4));
+  },
+
+  /** 金额格式化：1234.5 → ¥1,234.50（空值显示 ¥0.00） */
+  money(value) {
+    const n = Number(value);
+    const safe = isFinite(n) ? n : 0;
+    return '¥' + safe.toLocaleString('zh-CN', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    });
+  },
+
+  /** 证件号码脱敏：仅露首尾，中间固定星号 */
+  maskId(value) {
+    const s = Utils.trim(value);
+    if (!s) return '';
+    if (s.length <= 2) return s[0] + '*';
+    if (s.length <= 5) return s.slice(0, 1) + '*'.repeat(s.length - 2) + s.slice(-1);
+    return s.slice(0, 2) + '*'.repeat(Math.min(8, s.length - 4)) + s.slice(-2);
+  },
+
+  /** HTML 转义，防止用户输入破坏结构（XSS 基础防护） */
+  esc(str) {
+    return String(str == null ? '' : str).replace(/[&<>"']/g, ch => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[ch]));
+  },
+
+  trim(str) {
+    return String(str == null ? '' : str).trim();
+  }
+};
+
+/* ============================================================================
+ * 4. Store —— 本地缓存层（localStorage）
+ *    云端为主存储，本层负责三件事：首屏秒开（先渲染缓存）、离线可写、多标签页同步。
+ *    全文件只有这一层直接接触 localStorage。
+ * ==========================================================================*/
+const Store = {
+  /** 默认数据结构 */
+  empty() {
+    return {
+      version: CONFIG.DATA_VERSION,
+      cameras: [],
+      schedules: []
+    };
+  },
+
+  load() {
+    try {
+      const raw = localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (!raw) return Store.empty();
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return Store.empty();
+
+      // EXT-4 数据迁移扩展：v1 → v2 补租赁字段，v2 → v3 补「押金类型」，
+      //                      v3 → v4 补「结算字段」，保证旧缓存可读
+      const version = Number(parsed.version) || 1;
+      const rawSchedules = Array.isArray(parsed.schedules) ? parsed.schedules : [];
+      const schedules = version >= CONFIG.DATA_VERSION ? rawSchedules : rawSchedules.map(s =>
+        Object.assign({
+          depositType: CONFIG.DEPOSIT_TYPES[0],
+          depositAmount: '',
+          depositStatus: CONFIG.DEPOSIT_STATUS[0],
+          idProofType: CONFIG.ID_PROOF_TYPES[0],
+          idProofNumber: '',
+          rentIncome: '',
+          costExpense: '',
+          remark: '',
+          // v4 新增：结算类字段（实收 / 退款 / 扣款 / 结算备注）
+          actualRent: '',
+          refundAmount: '',
+          deductAmount: '',
+          settlementRemark: '',
+          settledAt: 0
+        }, s)
+      );
+
+      return {
+        version: CONFIG.DATA_VERSION,
+        cameras: Array.isArray(parsed.cameras) ? parsed.cameras : [],
+        schedules: schedules
+      };
+    } catch (err) {
+      console.warn('[Store] 读取本地数据失败，已回退为空数据', err);
+      return Store.empty();
+    }
+  },
+
+  save(data) {
+    try {
+      localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(data));
+      return true;
+    } catch (err) {
+      // 常见原因：隐私模式 / 容量超限
+      console.warn('[Store] 写入本地数据失败', err);
+      return false;
+    }
+  }
+};
+
+/* ============================================================================
+ * 5. Cloud —— 云端适配层（Supabase · PostgREST）
+ *    · 全文件唯一发起网络请求的地方，只用原生 fetch，不引入任何第三方 SDK
+ *    · 只负责「读写原始数据行」，不做业务判断，业务规则仍留在 Service
+ *    · 接口说明：
+ *        GET  /rest/v1/<table>?select=*          读取全表
+ *        POST /rest/v1/<table>  Prefer:merge-duplicates   按主键 upsert
+ *        DELETE /rest/v1/<table>?id=eq.<id>      删除单条（扩展位）
+ * ==========================================================================*/
+const Cloud = {
+  /** 是否已填写云端配置（URL + 密钥） */
+  get enabled() {
+    return !!(
+      String(CLOUD_CONFIG.SUPABASE_URL).trim() &&
+      String(CLOUD_CONFIG.SUPABASE_ANON_KEY).trim()
+    );
+  },
+
+  /** 去掉结尾多余的斜杠 */
+  get baseUrl() {
+    return String(CLOUD_CONFIG.SUPABASE_URL).trim().replace(/\/+$/, '');
+  },
+
+  /** Supabase 要求 apikey 与 Authorization 两个头都带 */
+  headers(extra) {
+    const key = String(CLOUD_CONFIG.SUPABASE_ANON_KEY).trim();
+    return Object.assign({
+      'apikey': key,
+      'Authorization': 'Bearer ' + key,
+      'Content-Type': 'application/json'
+    }, extra || {});
+  },
+
+  /** 底层请求：统一超时控制与错误信息 */
+  async request(path, options) {
+    if (!Cloud.enabled) throw new Error('未配置云端地址与密钥');
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), CLOUD_CONFIG.REQUEST_TIMEOUT_MS);
+
+    try {
+      const res = await fetch(Cloud.baseUrl + path, Object.assign({}, options, {
+        headers: Cloud.headers(options && options.headers),
+        signal: controller.signal
+      }));
+
+      const text = await res.text();
+      if (!res.ok) {
+        let detail = text;
+        try { detail = JSON.parse(text).message || text; } catch (e) { /* 非 JSON 错误体 */ }
+        throw new Error('云端返回 ' + res.status + '：' + (detail || res.statusText));
+      }
+      return text ? JSON.parse(text) : null;
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+
+  /** 读取一张表的全部记录 */
+  selectAll(table) {
+    const path = '/rest/v1/' + encodeURIComponent(table) + '?select=*&order=created_at.asc';
+    return Cloud.request(path, { method: 'GET' });
+  },
+
+  /**
+   * 批量 upsert（按主键 id 合并）
+   * Prefer: resolution=merge-duplicates 等价于 INSERT ... ON CONFLICT (id) DO UPDATE
+   */
+  upsert(table, rows) {
+    if (!rows || !rows.length) return Promise.resolve(null);
+    return Cloud.request('/rest/v1/' + encodeURIComponent(table), {
+      method: 'POST',
+      headers: { 'Prefer': 'resolution=merge-duplicates,return=minimal' },
+      body: JSON.stringify(rows)
+    });
+  },
+
+  /**
+   * EXT-9 删除同步：Service 删除设备 / 档期时调用 Sync.queueDelete，
+   * 由同步引擎统一补发 DELETE（离线删除不会被云端「复活」）
+   */
+  remove(table, id) {
+    const path = '/rest/v1/' + encodeURIComponent(table) + '?id=eq.' + encodeURIComponent(id);
+    return Cloud.request(path, { method: 'DELETE', headers: { 'Prefer': 'return=minimal' } });
+  }
+};
+
+/* ============================================================================
+ * 6. Mapper —— 行映射层
+ *    应用内部沿用原有字段名（camelCase），数据库列名用下划线，
+ *    上层业务代码因此「原数据结构完全不变」；换数据库时只改这一层。
+ * ==========================================================================*/
+const Mapper = {
+  cameraToRow(c) {
+    return {
+      id: c.id,
+      model: c.model,
+      serial: c.serial,
+      created_at: c.createdAt || Date.now(),
+      updated_at: new Date().toISOString()
+    };
+  },
+
+  cameraFromRow(r) {
+    return {
+      id: r.id,
+      model: r.model || '',
+      serial: r.serial || '',
+      createdAt: Number(r.created_at) || Date.now()
+    };
+  },
+
+  scheduleToRow(s) {
+    return {
+      id: s.id,
+      camera_id: s.cameraId,
+      user_name: s.userName,
+      start_date: s.startDate,
+      due_date: s.dueDate,
+      delivery_status: s.deliveryStatus,
+      returned_date: s.returnedDate || '',   // 未归还存空串，避免 null 判断
+      // 租赁业务字段：金额留空时写 null（numeric 列不接受空串）
+      deposit_type: s.depositType || CONFIG.DEPOSIT_TYPES[0],
+      deposit_amount: Mapper.moneyToDb(s.depositAmount),
+      deposit_status: s.depositStatus || CONFIG.DEPOSIT_STATUS[0],
+      id_proof_type: s.idProofType || CONFIG.ID_PROOF_TYPES[0],
+      id_proof_number: s.idProofNumber || '',
+      rent_income: Mapper.moneyToDb(s.rentIncome),
+      cost_expense: Mapper.moneyToDb(s.costExpense),
+      remark: s.remark || '',
+      // v5 结算类字段：同样遵循「空串 → null」约定（numeric 列不收空串）
+      actual_rent: Mapper.moneyToDb(s.actualRent),
+      refund_amount: Mapper.moneyToDb(s.refundAmount),
+      deduct_amount: Mapper.moneyToDb(s.deductAmount),
+      settlement_remark: s.settlementRemark || '',
+      settled_at: s.settledAt || null,
+      created_at: s.createdAt || Date.now(),
+      updated_at: new Date().toISOString()
+    };
+  },
+
+  scheduleFromRow(r) {
+    return {
+      id: r.id,
+      cameraId: r.camera_id,
+      userName: r.user_name || '',
+      startDate: r.start_date || '',
+      dueDate: r.due_date || '',
+      deliveryStatus: r.delivery_status || CONFIG.DELIVERY_STATUS[0],
+      returnedDate: r.returned_date || '',
+      // 租赁业务字段（旧数据缺列时自动补默认值）
+      depositType: r.deposit_type || CONFIG.DEPOSIT_TYPES[0],
+      depositAmount: Mapper.moneyFromDb(r.deposit_amount),
+      depositStatus: r.deposit_status || CONFIG.DEPOSIT_STATUS[0],
+      idProofType: r.id_proof_type || CONFIG.ID_PROOF_TYPES[0],
+      idProofNumber: r.id_proof_number || '',
+      rentIncome: Mapper.moneyFromDb(r.rent_income),
+      costExpense: Mapper.moneyFromDb(r.cost_expense),
+      remark: r.remark || '',
+      // v5 结算类字段（旧表/旧数据缺列时自动回落为空，不会报错）
+      actualRent: Mapper.moneyFromDb(r.actual_rent),
+      refundAmount: Mapper.moneyFromDb(r.refund_amount),
+      deductAmount: Mapper.moneyFromDb(r.deduct_amount),
+      settlementRemark: r.settlement_remark || '',
+      settledAt: Number(r.settled_at) || 0,
+      createdAt: Number(r.created_at) || Date.now()
+    };
+  },
+
+  /** 金额落库：'' / undefined → null，数字 → Number */
+  moneyToDb(value) {
+    if (value === '' || value === null || value === undefined) return null;
+    const n = Number(value);
+    return isFinite(n) ? n : null;
+  },
+
+  /** 金额读库：null → ''，保持应用内「空值 = 空字符串」的约定 */
+  moneyFromDb(value) {
+    if (value === null || value === undefined || value === '') return '';
+    const n = Number(value);
+    return isFinite(n) ? n : '';
+  }
+};
+
+/* ============================================================================
+ * 7. Sync —— 同步引擎
+ *    职责：
+ *      ① 启动拉取：页面加载后拉云端最新数据覆盖本地（离线时直接用缓存渲染）
+ *      ② 变更推送：新增 / 修改后防抖合并写回云端，实时刻录
+ *      ③ 变更监听：定时轮询 + 切回前台 + 网络恢复，他端改动自动刷新本页视图
+ *      ④ 离线降级：请求失败则转本地缓存与待推送队列，联网后自动续传
+ *    一致性策略：云端为准（cloud-wins）；本地「尚未推送成功」的记录在拉取时保留，
+ *               避免离线期间的改动被云端旧数据覆盖。
+ * ==========================================================================*/
+const Sync = {
+  status: 'local',                                   // local | connecting | syncing | online | offline | error
+  pending: { cameras: new Set(), schedules: new Set() },
+  // 待删除队列：离线时删掉的记录，联网后补发 DELETE，避免云端把记录「复活」
+  pendingDeletes: { cameras: new Set(), schedules: new Set() },
+  pulling: false,
+  flushing: false,
+  timer: null,
+  pushTimer: null,
+  lastFingerprint: '',
+  lastSyncAt: 0,
+
+  /* ---------------- 启动 ---------------- */
+  init() {
+    Sync.restoreQueue();
+    Sync.lastFingerprint = Sync.fingerprint(Service.data);
+    Sync.bindEvents();
+
+    if (!Cloud.enabled) {
+      Sync.setStatus('local');   // 未配置云端：行为与 v1.0 完全一致
+      return;
+    }
+
+    Sync.setStatus('connecting');
+    Sync.pull({ reason: 'boot' });
+
+    // 轮询间隔见 CLOUD_CONFIG.POLL_MS；页面不可见时跳过，省流量
+    Sync.timer = setInterval(() => {
+      if (document.hidden) return;
+      Sync.pull({ reason: 'poll' });
+    }, Math.max(1500, Number(CLOUD_CONFIG.POLL_MS) || 4000));
+  },
+
+  bindEvents() {
+    // 网络恢复：先把离线积压推上去，再拉最新
+    window.addEventListener('online', () => {
+      if (!Cloud.enabled) return;
+      Sync.setStatus('connecting');
+      Sync.pull({ reason: 'online' });
+    });
+
+    // 断网：界面立即体现为离线缓存
+    window.addEventListener('offline', () => {
+      if (!Cloud.enabled) return;
+      Sync.setStatus('offline');
+    });
+
+    // 切回前台：立刻对齐一次
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden || !Cloud.enabled) return;
+      Sync.pull({ reason: 'visible' });
+    });
+
+    // 点击角落状态标识：手动同步一次
+    if (View.el.cloudStatus) {
+      View.el.cloudStatus.addEventListener('click', () => {
+        if (!Cloud.enabled) {
+          View.toast('未配置云端，当前为本地存储模式', 'error');
+          return;
+        }
+        Sync.pull({ reason: 'manual' });
+      });
+    }
+  },
+
+  /* ---------------- 数据指纹：判断「云端数据是否真的变了」 ---------------- */
+  fingerprint(data) {
+    const cams = (data.cameras || [])
+      .map(c => [c.id, c.model, c.serial, c.createdAt].join('~'))
+      .sort().join('|');
+    const schs = (data.schedules || [])
+      .map(s => [s.id, s.cameraId, s.userName, s.startDate, s.dueDate, s.deliveryStatus,
+                 s.returnedDate, s.depositType, s.depositAmount, s.depositStatus, s.idProofType,
+                 s.idProofNumber, s.rentIncome, s.costExpense, s.remark,
+                 s.actualRent, s.refundAmount, s.deductAmount, s.settlementRemark, s.settledAt,
+                 s.createdAt].join('~'))
+      .sort().join('|');
+    return cams + '#' + schs;
+  },
+
+  /* ---------------- 拉取：云端 → 本地 ---------------- */
+  async pull(options) {
+    const reason = (options && options.reason) || 'poll';
+    if (!Cloud.enabled || Sync.pulling) return;
+    if (!navigator.onLine) {
+      Sync.setStatus('offline');
+      return;
+    }
+
+    Sync.pulling = true;
+    if (reason !== 'poll') Sync.setStatus(reason === 'boot' ? 'connecting' : 'syncing');
+
+    try {
+      // 离线期间攒下的改动先推送，避免被云端旧数据覆盖
+      if (Sync.hasPending()) await Sync.flush();
+
+      const tables = CLOUD_CONFIG.TABLES;
+      const result = await Promise.all([
+        Cloud.selectAll(tables.cameras),
+        Cloud.selectAll(tables.schedules)
+      ]);
+
+      let cameras = (result[0] || []).map(Mapper.cameraFromRow);
+      let schedules = (result[1] || []).map(Mapper.scheduleFromRow);
+
+      // 首次接入且云端为空、本地已有存量数据 → 自动迁移上云（可在配置中关闭）
+      if (reason === 'boot' && CLOUD_CONFIG.ADOPT_LOCAL_ON_EMPTY_CLOUD &&
+          !cameras.length && !schedules.length &&
+          (Service.data.cameras.length || Service.data.schedules.length)) {
+        await Sync.pushAll();
+        Sync.setStatus('online');
+        View.toast('已把本地存量数据上传到云端');
+        return;
+      }
+
+      // 本地已删除、但尚未同步到云端的记录：不能被云端旧数据拉回来
+      if (Sync.pendingDeletes.cameras.size) {
+        cameras = cameras.filter(c => !Sync.pendingDeletes.cameras.has(c.id));
+      }
+      if (Sync.pendingDeletes.schedules.size) {
+        schedules = schedules.filter(s => !Sync.pendingDeletes.schedules.has(s.id));
+      }
+
+      // 保留本地尚未推送成功的记录（离线改动优先于云端旧值）
+      if (Sync.pending.cameras.size) {
+        const keep = Service.data.cameras.filter(c => Sync.pending.cameras.has(c.id));
+        cameras = cameras.filter(c => !Sync.pending.cameras.has(c.id)).concat(keep);
+      }
+      if (Sync.pending.schedules.size) {
+        const keep = Service.data.schedules.filter(s => Sync.pending.schedules.has(s.id));
+        schedules = schedules.filter(s => !Sync.pending.schedules.has(s.id)).concat(keep);
+      }
+
+      Sync.apply({ cameras, schedules }, reason);
+      Sync.lastSyncAt = Date.now();
+      Sync.setStatus(Sync.hasPending() ? 'offline' : 'online');
+    } catch (err) {
+      console.warn('[Sync] 拉取云端数据失败，已降级为本地缓存', err);
+      const msg = String((err && err.message) || '');
+      // 配置/建表/权限类错误单独标识，避免被误当成网络问题
+      const fatal = /40[13]|404|relation|schema|permission|JWT/i.test(msg);
+      Sync.setStatus(fatal ? 'error' : 'offline', msg);
+    } finally {
+      Sync.pulling = false;
+    }
+  },
+
+  /** 用云端数据替换本地并刷新视图（仅在数据真的变化时才重绘） */
+  apply(data, reason) {
+    const fp = Sync.fingerprint(data);
+    if (fp === Sync.lastFingerprint) return;
+
+    const hadData = Service.data.cameras.length + Service.data.schedules.length > 0;
+
+    Service.data = {
+      version: CONFIG.DATA_VERSION,
+      cameras: data.cameras,
+      schedules: data.schedules
+    };
+    Sync.lastFingerprint = fp;
+    Store.save(Service.data);   // 同步落本地缓存，刷新 / 离线仍可用
+    View.renderAll();           // 重绘（自动保留表格内日期输入的焦点与值）
+
+    // 首次加载属于「云端覆盖本地」，不打扰；其余说明是其他成员的改动
+    if (reason && reason !== 'boot' && hadData) {
+      View.toast('已同步云端最新数据');
+    }
+  },
+
+  /* ---------------- 推送：本地 → 云端 ---------------- */
+  /** 业务层每次改动后调用：登记到待推送队列，防抖合并写入 */
+  queue(kind, id) {
+    if (!Cloud.enabled || !id || !Sync.pending[kind]) return;
+
+    Sync.pending[kind].add(id);
+    Sync.persistQueue();
+
+    clearTimeout(Sync.pushTimer);
+    Sync.pushTimer = setTimeout(
+      () => Sync.flush(),
+      Math.max(0, Number(CLOUD_CONFIG.PUSH_DEBOUNCE_MS) || 300)
+    );
+  },
+
+  /** 删除：登记待删除队列（同时取消同 id 的待推送，避免删了又被写回） */
+  queueDelete(kind, id) {
+    if (!Cloud.enabled || !id || !Sync.pendingDeletes[kind]) return;
+
+    Sync.pending[kind].delete(id);
+    Sync.pendingDeletes[kind].add(id);
+    Sync.persistQueue();
+
+    clearTimeout(Sync.pushTimer);
+    Sync.pushTimer = setTimeout(
+      () => Sync.flush(),
+      Math.max(0, Number(CLOUD_CONFIG.PUSH_DEBOUNCE_MS) || 300)
+    );
+  },
+
+  hasPending() {
+    return Sync.pending.cameras.size > 0 || Sync.pending.schedules.size > 0 ||
+           Sync.pendingDeletes.cameras.size > 0 || Sync.pendingDeletes.schedules.size > 0;
+  },
+
+  async flush() {
+    if (!Cloud.enabled || Sync.flushing || !Sync.hasPending()) return;
+    if (!navigator.onLine) {
+      Sync.setStatus('offline');
+      return;
+    }
+
+    Sync.flushing = true;
+    const camIds = Array.from(Sync.pending.cameras);
+    const schIds = Array.from(Sync.pending.schedules);
+    const delCamIds = Array.from(Sync.pendingDeletes.cameras);
+    const delSchIds = Array.from(Sync.pendingDeletes.schedules);
+    let succeeded = false;
+
+    try {
+      const camRows = camIds
+        .map(id => Service.data.cameras.find(c => c.id === id))
+        .filter(Boolean).map(Mapper.cameraToRow);
+      const schRows = schIds
+        .map(id => Service.data.schedules.find(s => s.id === id))
+        .filter(Boolean).map(Mapper.scheduleToRow);
+
+      await Promise.all([
+        Cloud.upsert(CLOUD_CONFIG.TABLES.cameras, camRows),
+        Cloud.upsert(CLOUD_CONFIG.TABLES.schedules, schRows)
+      ]);
+
+      // 再补发删除（DELETE 幂等，重复执行无副作用）
+      if (delCamIds.length || delSchIds.length) {
+        await Promise.all(
+          delCamIds.map(id => Cloud.remove(CLOUD_CONFIG.TABLES.cameras, id))
+            .concat(delSchIds.map(id => Cloud.remove(CLOUD_CONFIG.TABLES.schedules, id)))
+        );
+        delCamIds.forEach(id => Sync.pendingDeletes.cameras.delete(id));
+        delSchIds.forEach(id => Sync.pendingDeletes.schedules.delete(id));
+      }
+
+      // 只清除本次成功推送的 id（推送期间产生的新改动继续留在队列）
+      camIds.forEach(id => Sync.pending.cameras.delete(id));
+      schIds.forEach(id => Sync.pending.schedules.delete(id));
+      Sync.persistQueue();
+      Sync.lastSyncAt = Date.now();
+      succeeded = true;
+      if (!Sync.pulling) Sync.setStatus('online');
+    } catch (err) {
+      console.warn('[Sync] 推送失败，改动已留在本地队列，联网后自动续传', err);
+      Sync.persistQueue();
+      Sync.setStatus('offline', err.message);
+    } finally {
+      Sync.flushing = false;
+      // 推送过程中又产生了新改动：成功则立即补推一次（失败不重试，交给轮询节流）
+      if (succeeded && Sync.hasPending() && navigator.onLine) {
+        clearTimeout(Sync.pushTimer);
+        Sync.pushTimer = setTimeout(() => Sync.flush(), 60);
+      }
+    }
+  },
+
+  /** 全量上传（首次迁移或必要时手动触发） */
+  async pushAll() {
+    await Promise.all([
+      Cloud.upsert(CLOUD_CONFIG.TABLES.cameras, Service.data.cameras.map(Mapper.cameraToRow)),
+      Cloud.upsert(CLOUD_CONFIG.TABLES.schedules, Service.data.schedules.map(Mapper.scheduleToRow))
+    ]);
+    Sync.pending.cameras.clear();
+    Sync.pending.schedules.clear();
+    Sync.persistQueue();
+    Sync.lastSyncAt = Date.now();
+  },
+
+  /* ---------------- 待推送队列持久化（刷新不丢改动） ---------------- */
+  persistQueue() {
+    try {
+      const payload = {
+        cameras: Array.from(Sync.pending.cameras),
+        schedules: Array.from(Sync.pending.schedules),
+        deleteCameras: Array.from(Sync.pendingDeletes.cameras),
+        deleteSchedules: Array.from(Sync.pendingDeletes.schedules)
+      };
+      const empty = !payload.cameras.length && !payload.schedules.length &&
+                    !payload.deleteCameras.length && !payload.deleteSchedules.length;
+
+      if (empty) {
+        localStorage.removeItem(CONFIG.QUEUE_KEY);
+      } else {
+        localStorage.setItem(CONFIG.QUEUE_KEY, JSON.stringify(payload));
+      }
+    } catch (err) {
+      console.warn('[Sync] 待推送队列写入失败', err);
+    }
+  },
+
+  restoreQueue() {
+    try {
+      const raw = localStorage.getItem(CONFIG.QUEUE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) || {};
+      (parsed.cameras || []).forEach(id => Sync.pending.cameras.add(id));
+      (parsed.schedules || []).forEach(id => Sync.pending.schedules.add(id));
+      (parsed.deleteCameras || []).forEach(id => Sync.pendingDeletes.cameras.add(id));
+      (parsed.deleteSchedules || []).forEach(id => Sync.pendingDeletes.schedules.add(id));
+    } catch (err) {
+      console.warn('[Sync] 待推送队列读取失败', err);
+    }
+  },
+
+  /* ---------------- 状态标识（页面角落） ---------------- */
+  setStatus(state, detail) {
+    Sync.status = state;
+
+    const el = View.el.cloudStatus;
+    const dot = View.el.cloudDot;
+    const txt = View.el.cloudStatusText;
+    if (!el || !dot || !txt) return;
+
+    const meta = {
+      local:      { text: '本地存储',      dotClass: 'is-local' },
+      connecting: { text: '连接云端…',     dotClass: 'is-syncing' },
+      syncing:    { text: '同步中…',       dotClass: 'is-syncing' },
+      online:     { text: '云端已同步',    dotClass: 'is-online' },
+      offline:    { text: '离线·本地缓存', dotClass: 'is-offline' },
+      error:      { text: '云端异常',      dotClass: 'is-offline' }
+    }[state] || { text: '本地存储', dotClass: 'is-local' };
+
+    el.dataset.state = state;
+    dot.className = 'dot ' + meta.dotClass;
+    // 仅在文案变化时更新，避免读屏软件每轮轮询都重复播报
+    if (txt.textContent !== meta.text) txt.textContent = meta.text;
+
+    const tips = {
+      local: '未配置云端，数据仅保存在本机浏览器。填写代码顶部 CLOUD_CONFIG 即可开启团队共享。',
+      connecting: '正在连接云端数据库…',
+      syncing: '正在与云端同步…',
+      online: '已连接云端，多端数据自动同步。点击可立即同步。',
+      offline: '网络不可用，已降级为本地缓存；恢复联网后会自动把改动同步到云端。',
+      error: '云端连接异常，请检查配置，或按文件末尾说明创建数据表与权限策略。'
+    };
+
+    const extra = [];
+    if (Sync.lastSyncAt) {
+      extra.push('上次同步 ' + new Date(Sync.lastSyncAt).toLocaleTimeString('zh-CN', { hour12: false }));
+    }
+    if (Sync.hasPending()) {
+      extra.push('待同步 ' + (
+        Sync.pending.cameras.size + Sync.pending.schedules.size +
+        Sync.pendingDeletes.cameras.size + Sync.pendingDeletes.schedules.size
+      ) + ' 条');
+    }
+    if (detail) extra.push(String(detail).slice(0, 160));
+
+    el.title = tips[state] + (extra.length ? '\n' + extra.join(' · ') : '');
+  }
+};
+
+/* ============================================================================
+ * 8. Service —— 业务逻辑层（无 DOM 依赖，便于单测与复用）
+ * ==========================================================================*/
+const Service = {
+  data: Store.empty(),
+
+  /* ---------------- 设备 ---------------- */
+
+  listCameras() {
+    return Service.data.cameras.slice().sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  },
+
+  getCamera(id) {
+    return Service.data.cameras.find(c => c.id === id) || null;
+  },
+
+  /** 新增相机设备；返回 { ok, error?, camera? } */
+  addCamera({ model, serial }) {
+    const m = Utils.trim(model);
+    const s = Utils.trim(serial);
+
+    if (!m) return { ok: false, error: '请填写相机型号' };
+    if (!s) return { ok: false, error: '请填写机身序列号' };
+    if (m.length > 60) return { ok: false, error: '相机型号过长（最多 60 字）' };
+    if (s.length > 60) return { ok: false, error: '机身序列号过长（最多 60 字）' };
+
+    // 序列号唯一（忽略大小写与空格）
+    const dup = Service.data.cameras.some(c => Utils.trim(c.serial).toLowerCase() === s.toLowerCase());
+    if (dup) return { ok: false, error: '该机身序列号已存在，请勿重复登记' };
+
+    const camera = {
+      id: Utils.uid('cam'),
+      model: m,
+      serial: s,
+      createdAt: Date.now()
+      // EXT-5 设备字段扩展：此处可追加 brand / purchaseDate / status / remark 等字段
+    };
+
+    Service.data.cameras.push(camera);
+    Store.save(Service.data);
+    Sync.queue('cameras', camera.id);   // 云端同步：登记待推送
+    return { ok: true, camera };
+  },
+
+  /* ---------------- 档期 ---------------- */
+
+  listSchedules() {
+    // 最新登记的在最前
+    return Service.data.schedules.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  },
+
+  schedulesOf(cameraId) {
+    return Service.data.schedules.filter(s => s.cameraId === cameraId);
+  },
+
+  /** 金额解析：空值合法（返回 ''），非法给出错误，合法保留两位小数 */
+  parseAmount(raw, label) {
+    const text = Utils.trim(raw);
+    if (!text) return { ok: true, value: '' };
+
+    const n = Number(text);
+    if (!isFinite(n)) return { ok: false, error: label + '必须是数字' };
+    if (n < 0) return { ok: false, error: label + '不能为负数' };
+    if (n > 9999999) return { ok: false, error: label + '金额过大（上限 9999999 元）' };
+
+    return { ok: true, value: Math.round(n * 100) / 100 };
+  },
+
+  getSchedule(id) {
+    return Service.data.schedules.find(s => s.id === id) || null;
+  },
+
+  /**
+   * EXT-6 冲突校验（v5 重写：修复「逾期未还仍可继续排期」的重复排期漏洞）
+   *
+   * ★ 占用区间模型：
+   *     未登记实际收回日期的档期 → 占用区间 [startDate, +∞)
+   *     已登记实际收回日期的档期 → 不占用（可立即排下一档）
+   *
+   *   为什么结束端是「无限远」而不是 dueDate：
+   *     预计归还日只是计划，相机实物是否回到手上只有「实际收回日期」能证明。
+   *     若用 dueDate 当结束端，一旦档期逾期（dueDate 已过而相机未还），
+   *     任何排在 dueDate 之后的新档期都会被判为「不冲突」→ 同一台机器被重复排期。
+   *     这正是本次要修的核心 BUG。
+   *
+   * ★ 冲突条件：新档期 [startDate, dueDate] 与 [existStart, +∞) 有交集
+   *     ⇔ dueDate >= existStart
+   *   （新档期整体早于占用起点时无交集，属于补录历史，允许）
+   *
+   * 返回所有冲突档期（按领用日升序），供提示与拦截使用。
+   */
+  findConflicts(cameraId, startDate, dueDate, excludeId) {
+    if (!cameraId || !startDate || !dueDate) return [];
+
+    return Service.data.schedules
+      .filter(s =>
+        s.cameraId === cameraId &&
+        s.id !== excludeId &&
+        !s.returnedDate &&          // 已归还：不参与占用判断
+        dueDate >= s.startDate       // 未归还：占用到「无限远」
+      )
+      .sort((a, b) => String(a.startDate || '').localeCompare(String(b.startDate || '')));
+  },
+
+  /** 取最早开始的一条冲突（表单实时提示 / 提交拦截共用） */
+  findConflict(cameraId, startDate, dueDate, excludeId) {
+    return Service.findConflicts(cameraId, startDate, dueDate, excludeId)[0] || null;
+  },
+
+  /** 冲突详情文案：使用人 + 占用时间段 + 归还状态，提示与报错复用同一套措辞 */
+  conflictText(schedule, count) {
+    if (!schedule) return '';
+    const more = count && count > 1 ? '（另有 ' + (count - 1) + ' 条未归还档期）' : '';
+    return '该相机已被 ' + schedule.userName + ' 占用：' + schedule.startDate +
+           ' 领用 · 预计 ' + schedule.dueDate + ' 归还 · 尚未登记实际收回' + more;
+  },
+
+  /** 新增档期记录；返回 { ok, error?, conflict?, schedule? } */
+  addSchedule({
+    cameraId, userName, startDate, dueDate, deliveryStatus,
+    depositType, depositAmount, depositStatus, idProofType, idProofNumber,
+    rentIncome, costExpense, remark
+  }) {
+    const name = Utils.trim(userName);
+
+    if (!cameraId) return { ok: false, error: '请选择关联相机' };
+    if (!Service.getCamera(cameraId)) return { ok: false, error: '关联相机不存在，请刷新后重试' };
+    if (!name) return { ok: false, error: '请填写使用人员姓名' };
+    if (name.length > 30) return { ok: false, error: '姓名过长（最多 30 字）' };
+    if (!startDate) return { ok: false, error: '请选择领用起始日期' };
+    if (!dueDate) return { ok: false, error: '请选择预计归还日期' };
+    if (dueDate < startDate) return { ok: false, error: '预计归还日期不能早于领用起始日期' };
+
+    // —— 提交二次强校验（第二道闸门）——
+    // 即使前端下拉被置灰限制绕过（手改 DOM / 老数据），也必须在这里拦住
+    const conflicts = Service.findConflicts(cameraId, startDate, dueDate);
+    if (conflicts.length) {
+      return {
+        ok: false,
+        conflict: conflicts[0],
+        conflicts,
+        error: '时间冲突，无法排期 —— ' + Service.conflictText(conflicts[0], conflicts.length)
+      };
+    }
+
+    const status = CONFIG.DELIVERY_STATUS.includes(deliveryStatus)
+      ? deliveryStatus
+      : CONFIG.DELIVERY_STATUS[0];
+
+    // —— 租赁金额字段：全部选填，填了就必须是合法非负数字 ——
+    const deposit = Service.parseAmount(depositAmount, '押金金额');
+    if (!deposit.ok) return { ok: false, error: deposit.error };
+
+    const rent = Service.parseAmount(rentIncome, '应收租金');
+    if (!rent.ok) return { ok: false, error: rent.error };
+
+    const cost = Service.parseAmount(costExpense, '成本支出');
+    if (!cost.ok) return { ok: false, error: cost.error };
+
+    const depStatus = CONFIG.DEPOSIT_STATUS.includes(depositStatus)
+      ? depositStatus
+      : CONFIG.DEPOSIT_STATUS[0];
+
+    // —— 押金类型：会反向约束金额与状态（免押 / 无押金场景）——
+    const depType = CONFIG.DEPOSIT_TYPES.includes(depositType)
+      ? depositType
+      : CONFIG.DEPOSIT_TYPES[0];
+
+    let depAmount = deposit.value;
+    let depStatusFinal = depStatus;
+
+    if (depType === CONFIG.DEPOSIT_TYPES[1]) {
+      // 支付宝免押：金额可填 0 或免押授权额度；未收款时自动视为已收取
+      if (depStatusFinal === '未收取') depStatusFinal = '已收取';
+    } else if (depType === CONFIG.DEPOSIT_TYPES[2]) {
+      // 无押金：金额固定为 0，不参与「待收押金总额」统计
+      depAmount = 0;
+    }
+
+    // —— 证件抵押：选了类型就必须有号码；无抵押则清空号码 ——
+    const idType = CONFIG.ID_PROOF_TYPES.includes(idProofType)
+      ? idProofType
+      : CONFIG.ID_PROOF_TYPES[0];
+    const rawIdNum = Utils.trim(idProofNumber);
+
+    if (rawIdNum.length > 40) return { ok: false, error: '证件号码过长（最多 40 字）' };
+
+    const idNum = idType === CONFIG.ID_PROOF_TYPES[0] ? '' : rawIdNum;
+    if (idType !== CONFIG.ID_PROOF_TYPES[0] && !idNum) {
+      return { ok: false, error: '已选择「' + idType + '」抵押，请填写证件号码' };
+    }
+
+    const note = Utils.trim(remark);
+    if (note.length > 200) return { ok: false, error: '档期备注过长（最多 200 字）' };
+
+    const schedule = {
+      id: Utils.uid('sch'),
+      cameraId,
+      userName: name,
+      startDate,
+      dueDate,
+      deliveryStatus: status,
+      returnedDate: '',      // 空字符串 = 尚未归还
+      // —— 租赁业务字段（EXT-7 档期字段扩展：后续可继续追加）——
+      depositType: depType,           // 正常收押 / 支付宝免押 / 无押金
+      depositAmount: depAmount,       // 数字或 ''（留空）；无押金固定 0
+      depositStatus: depStatusFinal,
+      idProofType: idType,
+      idProofNumber: idNum,
+      rentIncome: rent.value,
+      costExpense: cost.value,
+      remark: note,
+      // —— 结算字段（v5）：新建档期时一律为空，登记收回时才写入 ——
+      actualRent: '',          // 实收租金（提前归还时小于应收）
+      refundAmount: '',        // 退款金额
+      deductAmount: '',        // 扣款金额（损坏、逾期等）
+      settlementRemark: '',    // 结算备注
+      settledAt: 0,            // 结算登记时间戳（0 = 未结算）
+      createdAt: Date.now()
+    };
+
+    Service.data.schedules.push(schedule);
+    Store.save(Service.data);
+    Sync.queue('schedules', schedule.id);   // 云端同步：登记待推送
+    return { ok: true, schedule };
+  },
+
+  /** 删除档期记录（同步删除云端，走 Sync 删除队列） */
+  deleteSchedule(id) {
+    const index = Service.data.schedules.findIndex(s => s.id === id);
+    if (index < 0) return { ok: false, error: '档期记录不存在' };
+
+    Service.data.schedules.splice(index, 1);
+    Store.save(Service.data);
+    Sync.queueDelete('schedules', id);
+    return { ok: true };
+  },
+
+  /**
+   * 删除相机设备
+   * 约束：存在未完成（未登记实际收回）的档期时禁止删除；仅历史档期时允许，
+   *      历史档期保留，列表中显示「相机已移除」
+   */
+  deleteCamera(id) {
+    const camera = Service.getCamera(id);
+    if (!camera) return { ok: false, error: '相机设备不存在' };
+
+    const unfinished = Service.data.schedules.filter(s => s.cameraId === id && !s.returnedDate);
+    if (unfinished.length) {
+      return {
+        ok: false,
+        error: '该设备还有 ' + unfinished.length + ' 条未完成档期（' +
+               unfinished[0].userName + ' 等），请先处理完档期再删除'
+      };
+    }
+
+    const history = Service.data.schedules.filter(s => s.cameraId === id).length;
+    Service.data.cameras = Service.data.cameras.filter(c => c.id !== id);
+    Store.save(Service.data);
+    Sync.queueDelete('cameras', id);
+    return { ok: true, history };
+  },
+
+  /** 切换送达状态（未送达 ⇄ 已送达） */
+  toggleDelivery(id) {
+    const s = Service.data.schedules.find(x => x.id === id);
+    if (!s) return { ok: false, error: '档期记录不存在' };
+
+    s.deliveryStatus = s.deliveryStatus === '已送达' ? '未送达' : '已送达';
+    s.updatedAt = Date.now();
+    Store.save(Service.data);
+    Sync.queue('schedules', s.id);   // 云端同步：登记待推送
+    return { ok: true, schedule: s, deliveryStatus: s.deliveryStatus };
+  },
+
+  /**
+   * ★ 登记收回 + 结算（一次写完，对应「登记收回」弹层，无需二次编辑）
+   * payload: { returnedDate, actualRent, refundAmount, deductAmount, settlementRemark }
+   *
+   * 规则：
+   *   · 收回日期：留空默认今天；不得早于领用起始日；不设上限（支持补登历史归还）
+   *   · 金额：选填；填了必须是 ≥0 的数字，保存时四舍五入到分
+   *   · 收回日期 < 预计归还日 → 判定为「提前归还」，返回 early:true 供界面提示登记退款
+   */
+  settleReturn(id, payload) {
+    const s = Service.getSchedule(id);
+    if (!s) return { ok: false, error: '档期记录不存在' };
+
+    const p = payload || {};
+
+    const value = Utils.trim(p.returnedDate) || Utils.today();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return { ok: false, error: '收回日期格式不正确' };
+    if (value < s.startDate) return { ok: false, error: '收回日期不能早于领用起始日期' };
+
+    const actual = Service.parseAmount(p.actualRent, '实收租金');
+    if (!actual.ok) return actual;
+
+    const refund = Service.parseAmount(p.refundAmount, '退款金额');
+    if (!refund.ok) return refund;
+
+    const deduct = Service.parseAmount(p.deductAmount, '扣款金额');
+    if (!deduct.ok) return deduct;
+
+    const note = Utils.trim(p.settlementRemark);
+    if (note.length > CONFIG.SETTLE_REMARK_MAX) {
+      return { ok: false, error: '结算备注过长（最多 ' + CONFIG.SETTLE_REMARK_MAX + ' 字）' };
+    }
+
+    s.returnedDate = value;
+    s.actualRent = actual.value;
+    s.refundAmount = refund.value;
+    s.deductAmount = deduct.value;
+    s.settlementRemark = note;
+    s.settledAt = Date.now();
+    s.updatedAt = Date.now();
+
+    Store.save(Service.data);
+    Sync.queue('schedules', s.id);   // 云端同步：登记待推送
+    return { ok: true, schedule: s, early: value < s.dueDate };
+  },
+
+  /** 仅登记实际收回日期（保留旧接口；已填写的结算字段原样保留） */
+  setReturnedDate(id, date) {
+    const s = Service.getSchedule(id);
+    if (!s) return { ok: false, error: '档期记录不存在' };
+
+    const value = Utils.trim(date) || Utils.today();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return { ok: false, error: '收回日期格式不正确' };
+    // 只限制不能早于领用起始日；允许晚于今天（补登历史归还记录）
+    if (value < s.startDate) return { ok: false, error: '收回日期不能早于领用起始日期' };
+
+    s.returnedDate = value;
+    s.updatedAt = Date.now();
+    Store.save(Service.data);
+    Sync.queue('schedules', s.id);   // 云端同步：登记待推送
+    return { ok: true, schedule: s };
+  },
+
+  /** 撤销归还登记，恢复为「在借」（结算金额保留，便于重新登记时直接复用） */
+  clearReturnedDate(id) {
+    const s = Service.data.schedules.find(x => x.id === id);
+    if (!s) return { ok: false, error: '档期记录不存在' };
+
+    s.returnedDate = '';
+    s.settledAt = 0;
+    s.updatedAt = Date.now();
+    Store.save(Service.data);
+    Sync.queue('schedules', s.id);   // 云端同步：登记待推送
+    return { ok: true, schedule: s };
+  },
+
+  /* ---------------- 结算汇总（视图与统计共用） ---------------- */
+
+  /**
+   * 结算汇总：实收 / 退款 / 扣款 / 净额 / 与应收的差额
+   * 口径：实收租金是「收到的钱」，退款是退出去的钱，扣款是额外扣收的钱
+   *       结算净额 = 实收 − 退款 + 扣款；差额 = 实收 − 应收（负数即少收）
+   * 完全没有任何结算数据时返回 null，列表据此显示「未结算 / —」
+   */
+  settlementOf(s) {
+    if (!s) return null;
+
+    const has = v => v !== '' && v !== null && v !== undefined;
+    const hasActual = has(s.actualRent);
+    const hasRefund = has(s.refundAmount);
+    const hasDeduct = has(s.deductAmount);
+    const hasNote = !!Utils.trim(s.settlementRemark);
+
+    if (!hasActual && !hasRefund && !hasDeduct && !hasNote) return null;
+
+    const actual = Number(s.actualRent) || 0;
+    const refund = Number(s.refundAmount) || 0;
+    const deduct = Number(s.deductAmount) || 0;
+    const due = Number(s.rentIncome) || 0;
+
+    return {
+      hasActual,
+      hasRefund,
+      hasDeduct,
+      hasNote,
+      actual,
+      refund,
+      deduct,
+      due,
+      net: Math.round((actual - refund + deduct) * 100) / 100,
+      diff: Math.round((actual - due) * 100) / 100,
+      hasDue: has(s.rentIncome)
+    };
+  },
+
+  /* ---------------- 派生状态 ---------------- */
+
+  /** 档期状态：已归还 / 已逾期 / 待开始 / 使用中 / 待送达 */
+  scheduleState(s) {
+    if (s.returnedDate) {
+      // 按期归还显示 ok，超期归还仍标记为已归还（灰）
+      return s.returnedDate > s.dueDate
+        ? CONFIG.SCHEDULE_STATE.finished
+        : CONFIG.SCHEDULE_STATE.returned;
+    }
+    if (s.dueDate < Utils.today()) return CONFIG.SCHEDULE_STATE.overdue;
+    if (s.startDate > Utils.today()) return CONFIG.SCHEDULE_STATE.upcoming;  // 尚未到领用起始日
+    if (s.deliveryStatus === '已送达') return CONFIG.SCHEDULE_STATE.inUse;
+    return CONFIG.SCHEDULE_STATE.pending;
+  },
+
+  /**
+   * 状态归组：把 6 个状态收敛到筛选栏的 4 个桶
+   * 「使用中」同时包含「待送达」（已开始但未确认送达，同属进行中）
+   */
+  stateGroup(key) {
+    if (key === 'returned' || key === 'finished') return 'returned';
+    if (key === 'overdue') return 'overdue';
+    if (key === 'upcoming') return 'upcoming';
+    return 'inUse';
+  },
+
+  /* ---------------- 搜索 / 日期筛选（纯函数，便于复用与测试） ---------------- */
+
+  /**
+   * 判断某一天是否落在档期租期内：领用日 ≤ 所选日期 ≤ 归还日
+   * 归还日取值：已登记实际收回日期则用它，否则用预计归还日期
+   */
+  coversDate(s, date) {
+    if (!date) return true;
+    const end = s.returnedDate || s.dueDate;
+    return s.startDate <= date && date <= end;
+  },
+
+  /** 关键字模糊匹配：使用人姓名 / 相机型号 / 机身序列号（不区分大小写） */
+  matchKeyword(s, keyword) {
+    const kw = Utils.trim(keyword).toLowerCase();
+    if (!kw) return true;
+    const cam = Service.getCamera(s.cameraId);
+    const haystack = [
+      s.userName || '',
+      cam ? cam.model : '',
+      cam ? cam.serial : ''
+    ].join(' ').toLowerCase();
+    return haystack.indexOf(kw) >= 0;
+  },
+
+  /**
+   * 相机当前占用记录（取最早开始的一条，用于设备列表展示）
+   * ★ 强规则：判据只有「是否登记了实际收回日期」。
+   *   超过预计归还日期并不会自动释放占用——必须人工登记收回日期才变回空闲，
+   *   这样设备状态始终反映「实物是否还在外面」。
+   */
+  activeScheduleOf(cameraId) {
+    return Service.data.schedules
+      .filter(s => s.cameraId === cameraId && !s.returnedDate)
+      .sort((a, b) => String(a.startDate || '').localeCompare(String(b.startDate || '')))[0] || null;
+  },
+
+  /** 是否有任何在借记录（= 存在未登记收回日期的档期） */
+  isBusy(cameraId) {
+    return !!Service.activeScheduleOf(cameraId);
+  },
+
+  /** 概览统计（含押金与租金汇总） */
+  stats() {
+    const cameras = Service.data.cameras;
+    const busy = cameras.filter(c => Service.isBusy(c.id)).length;
+    const overdue = Service.data.schedules.filter(
+      s => !s.returnedDate && s.dueDate < Utils.today()
+    ).length;
+
+    // 待收押金：押金状态仍为「未收取」的金额合计（无押金/免押已收的不计入）
+    const depositPending = Service.data.schedules
+      .filter(s => (s.depositType || CONFIG.DEPOSIT_TYPES[0]) !== CONFIG.DEPOSIT_TYPES[2])
+      .filter(s => (s.depositStatus || CONFIG.DEPOSIT_STATUS[0]) === '未收取')
+      .reduce((sum, s) => sum + (Number(s.depositAmount) || 0), 0);
+
+    // 累计应收租金：所有档期「应收租金」合计（含进行中与已归还，反映合同口径）
+    const rentTotal = Service.data.schedules
+      .reduce((sum, s) => sum + (Number(s.rentIncome) || 0), 0);
+
+    // 累计实收租金：已登记结算的「实收租金」合计（未结算的档期不计入，反映回款口径）
+    const rentActualTotal = Service.data.schedules
+      .reduce((sum, s) => sum + (Number(s.actualRent) || 0), 0);
+
+    return {
+      cameras: cameras.length,
+      busy,
+      idle: cameras.length - busy,
+      overdue,
+      depositPending: Math.round(depositPending * 100) / 100,
+      rentTotal: Math.round(rentTotal * 100) / 100,
+      rentActualTotal: Math.round(rentActualTotal * 100) / 100
+    };
+  }
+};
+
+/* ============================================================================
+ * 9. View —— 渲染层
+ * ==========================================================================*/
+const View = {
+  el: {
+    tbodyCameras: document.getElementById('tbody-cameras'),
+    tbodySchedules: document.getElementById('tbody-schedules'),
+    countCameras: document.getElementById('count-cameras'),
+    countSchedules: document.getElementById('count-schedules'),
+    hintCameras: document.getElementById('hint-cameras'),
+    hintSchedules: document.getElementById('hint-schedules'),
+    statCameras: document.getElementById('stat-cameras'),
+    statBusy: document.getElementById('stat-busy'),
+    statIdle: document.getElementById('stat-idle'),
+    statOverdue: document.getElementById('stat-overdue'),
+    formCamera: document.getElementById('form-camera'),
+    formSchedule: document.getElementById('form-schedule'),
+    msgCamera: document.getElementById('msg-camera'),
+    msgSchedule: document.getElementById('msg-schedule'),
+    selCamera: document.getElementById('sch-camera'),
+    selDelivery: document.getElementById('sch-delivery'),
+    inputStart: document.getElementById('sch-start'),
+    inputDue: document.getElementById('sch-due'),
+    hintScheduleForm: document.getElementById('hint-schedule-form'),
+    btnAddSchedule: document.getElementById('btn-add-schedule'),
+    toastHost: document.getElementById('toast-host'),
+    // 租赁字段（选填）
+    inputDeposit: document.getElementById('sch-deposit'),
+    selDepositType: document.getElementById('sch-deposit-type'),
+    selDepositStatus: document.getElementById('sch-deposit-status'),
+    selIdType: document.getElementById('sch-idtype'),
+    inputIdNum: document.getElementById('sch-idnum'),
+    inputRent: document.getElementById('sch-rent'),
+    inputCost: document.getElementById('sch-cost'),
+    inputRemark: document.getElementById('sch-remark'),
+    conflictHint: document.getElementById('conflict-hint'),
+    // 档期筛选栏
+    filterSearch: document.getElementById('filter-search'),
+    filterDate: document.getElementById('filter-date'),
+    filterCamera: document.getElementById('filter-camera'),
+    filterStatus: document.getElementById('filter-status'),
+    filterCount: document.getElementById('filter-count'),
+    filterReset: document.getElementById('filter-reset'),
+    statDeposit: document.getElementById('stat-deposit'),
+    statRent: document.getElementById('stat-rent'),
+    statRentActual: document.getElementById('stat-rent-actual'),
+    // 结算弹层（登记收回）
+    modalSettle: document.getElementById('modal-settle'),
+    settleTitle: document.getElementById('settle-title'),
+    settleSub: document.getElementById('settle-sub'),
+    formSettle: document.getElementById('form-settle'),
+    settleSummary: document.getElementById('settle-summary'),
+    settleDate: document.getElementById('settle-date'),
+    settleActual: document.getElementById('settle-actual'),
+    settleRefund: document.getElementById('settle-refund'),
+    settleDeduct: document.getElementById('settle-deduct'),
+    settleRemark: document.getElementById('settle-remark'),
+    settleHint: document.getElementById('settle-hint'),
+    msgSettle: document.getElementById('msg-settle'),
+    fieldRefund: document.getElementById('field-refund'),
+    // 云端同步状态标识
+    cloudStatus: document.getElementById('cloud-status'),
+    cloudDot: document.getElementById('cloud-dot'),
+    cloudStatusText: document.getElementById('cloud-status-text')
+  },
+
+  /** 当前打开的结算弹层所对应的档期 id（null = 未打开） */
+  settle: { id: null },
+
+  /** 列表筛选状态（View 内部状态，不持久化）：四个条件互相叠加 */
+  filter: { keyword: '', date: '', cameraModel: '', status: '' },
+
+  /** 已展开明细的档期 id（重绘后保持展开状态） */
+  expanded: new Set(),
+
+  /** 整体刷新（自动保留表格内日期输入的焦点与已选值，避免同步刷新打断录入） */
+  renderAll() {
+    View.preserveFocus(() => {
+      View.renderStats();
+      View.renderCameras();
+      View.renderFilters();
+      View.renderSchedules();
+      View.renderCameraOptions();      // 相机下拉：按当前时段标注 / 置灰冲突设备
+      View.renderAvailabilityHint();   // 可用性提示与相机下拉同步刷新
+    });
+  },
+
+  /** 重绘会重建表格行，这里记录并还原「实际收回日期」输入框的焦点与值 */
+  preserveFocus(draw) {
+    const active = document.activeElement;
+    const returnId = active && active.dataset ? active.dataset.returnInput : null;
+    const value = returnId ? active.value : null;
+
+    draw();
+
+    if (returnId) {
+      const input = document.querySelector('[data-return-input="' + returnId + '"]');
+      if (input) {
+        if (value) input.value = value;
+        input.focus({ preventScroll: true });
+      }
+    }
+  },
+
+  renderStats() {
+    const st = Service.stats();
+    View.el.statCameras.textContent = st.cameras;
+    View.el.statBusy.textContent = st.busy;
+    View.el.statIdle.textContent = st.idle;
+    View.el.statOverdue.textContent = st.overdue;
+    View.el.statOverdue.classList.toggle('is-warn', st.overdue > 0);
+    View.el.statDeposit.textContent = Utils.money(st.depositPending);
+    View.el.statRent.textContent = Utils.money(st.rentTotal);
+    View.el.statRentActual.textContent = Utils.money(st.rentActualTotal);
+
+    View.el.countCameras.textContent = st.cameras;
+    View.el.countSchedules.textContent = Service.data.schedules.length;
+  },
+
+  /* ---------------- 筛选栏 ---------------- */
+  renderFilters() {
+    // 相机型号下拉：从现有设备去重生成，设备被删后自动失效回落「全部」
+    const models = Array.from(new Set(Service.listCameras().map(c => c.model))).sort();
+    const selCam = View.el.filterCamera;
+
+    selCam.innerHTML = '<option value="">全部相机</option>' + models
+      .map(m => '<option value="' + Utils.esc(m) + '">' + Utils.esc(m) + '</option>')
+      .join('');
+
+    if (View.filter.cameraModel && !models.includes(View.filter.cameraModel)) {
+      View.filter.cameraModel = '';
+    }
+    selCam.value = View.filter.cameraModel;
+
+    // 状态下拉：由 CONFIG.SCHEDULE_FILTERS 驱动，只初始化一次
+    const selStatus = View.el.filterStatus;
+    if (!selStatus.options.length) {
+      selStatus.innerHTML = CONFIG.SCHEDULE_FILTERS
+        .map(f => '<option value="' + f.value + '">' + Utils.esc(f.label) + '</option>')
+        .join('');
+    }
+    selStatus.value = View.filter.status;
+  },
+
+  /* ---------------- 设备列表 ---------------- */
+  renderCameras() {
+    const cameras = Service.listCameras();
+    View.el.hintCameras.textContent = '共 ' + cameras.length + ' 台';
+
+    if (!cameras.length) {
+      View.el.tbodyCameras.innerHTML = View.emptyRow(6,
+        '还没有登记相机设备',
+        '在上方表单填写相机型号与机身序列号，即可开始建立设备台账');
+      return;
+    }
+
+    View.el.tbodyCameras.innerHTML = cameras.map(cam => {
+      const active = Service.activeScheduleOf(cam.id);
+      const total = Service.schedulesOf(cam.id).length;
+
+      const stateBadge = active
+        ? '<span class="badge is-accent">借出中</span>'
+        : '<span class="badge is-idle">空闲</span>';
+
+      const stateSub = active
+        ? '<span class="cell-sub">' + Utils.esc(active.userName) + ' · 应还 ' + Utils.esc(active.dueDate) + '</span>'
+        : '';
+
+      return ''
+        + '<tr>'
+        +   '<td class="cell-strong">' + Utils.esc(cam.model) + '</td>'
+        +   '<td class="mono">' + Utils.esc(cam.serial) + '</td>'
+        +   '<td>' + stateBadge + stateSub + '</td>'
+        +   '<td class="num">' + total + '</td>'
+        +   '<td class="muted">' + Utils.esc(Utils.shortDate(Utils.dateFromTs(cam.createdAt))) + '</td>'
+        +   '<td><div class="row-actions">'
+        +     '<button class="btn btn-ghost btn-sm btn-danger-ghost" type="button"'
+        +       ' data-action="delete-camera" data-id="' + cam.id + '">删除</button>'
+        +   '</div></td>'
+        + '</tr>';
+    }).join('');
+  },
+
+  /* ---------------- 档期列表（含筛选 / 明细展开 / 置灰） ---------------- */
+  renderSchedules() {
+    const all = Service.listSchedules();
+
+    // 筛选：文本搜索 + 日期 + 相机型号（精确匹配）+ 档期状态分组，四者叠加生效
+    const list = all.filter(s => {
+      if (!Service.matchKeyword(s, View.filter.keyword)) return false;
+      if (!Service.coversDate(s, View.filter.date)) return false;
+      if (View.filter.cameraModel) {
+        const cam = Service.getCamera(s.cameraId);
+        if (!cam || cam.model !== View.filter.cameraModel) return false;
+      }
+      if (View.filter.status) {
+        const state = Service.scheduleState(s);
+        if (Service.stateGroup(state.key) !== View.filter.status) return false;
+      }
+      return true;
+    });
+
+    const filtering = !!(View.filter.keyword || View.filter.date ||
+                         View.filter.cameraModel || View.filter.status);
+    View.el.hintSchedules.textContent = '共 ' + all.length + ' 条';
+    View.el.filterCount.textContent = filtering ? '显示 ' + list.length + ' / ' + all.length + ' 条' : '';
+
+    if (!list.length) {
+      View.el.tbodySchedules.innerHTML = filtering
+        ? View.emptyRow(11, '没有符合筛选条件的档期',
+            View.filter.date
+              ? View.filter.date + ' 当天没有处于租期内的档期，可清空日期或点「重置」'
+              : '试试更换搜索词、相机型号或档期状态，或点「重置」查看全部记录')
+        : View.emptyRow(11, '还没有档期记录',
+            Service.data.cameras.length
+              ? '在上方表单选择相机并登记使用人与归还计划'
+              : '请先在「设备管理」中登记至少一台相机设备');
+      return;
+    }
+
+    View.el.tbodySchedules.innerHTML = list.map(s => {
+      const cam = Service.getCamera(s.cameraId);
+      const state = Service.scheduleState(s);
+      const isReturned = !!s.returnedDate;
+      const overdue = state.key === 'overdue';
+      const expanded = View.expanded.has(s.id);
+
+      // 相机信息（若相机被删除则降级显示）
+      const camCell = cam
+        ? '<span class="cell-strong">' + Utils.esc(cam.model) + '</span>'
+          + '<span class="cell-sub mono">' + Utils.esc(cam.serial) + '</span>'
+        : '<span class="muted">（相机已移除）</span>';
+
+      // 预计归还：逾期时标红并给出天数提示
+      const dueCell = overdue
+        ? '<span class="text-danger num">' + Utils.esc(s.dueDate) + '</span>'
+          + '<span class="cell-sub text-danger">已超期 ' + Math.abs(Utils.daysFromToday(s.dueDate)) + ' 天</span>'
+        : '<span class="num">' + Utils.esc(s.dueDate) + '</span>';
+
+      // 送达状态：徽标 + 切换按钮
+      const deliveryCell = ''
+        + '<div class="inline">'
+        +   (s.deliveryStatus === '已送达'
+              ? '<span class="badge is-ok">已送达</span>'
+              : '<span class="badge is-warn">未送达</span>')
+        +   '<button class="btn btn-ghost btn-sm" type="button" data-action="toggle-delivery"'
+        +     ' data-id="' + s.id + '">'
+        +     (s.deliveryStatus === '已送达' ? '改为未送达' : '标记已送达')
+        +   '</button>'
+        + '</div>';
+
+      // 押金：金额 + 类型徽标（支付宝免押 / 无押金）+ 收取状态徽标
+      const depType = s.depositType || CONFIG.DEPOSIT_TYPES[0];
+      const depStatus = s.depositStatus || CONFIG.DEPOSIT_STATUS[0];
+      const depTone = depStatus === '已收取' ? 'is-ok' : (depStatus === '已退还' ? 'is-idle' : 'is-warn');
+      const hasDeposit = s.depositAmount !== '' && s.depositAmount != null;
+      const noDeposit = depType === CONFIG.DEPOSIT_TYPES[2];
+      const alipayFree = depType === CONFIG.DEPOSIT_TYPES[1];
+
+      // 免押 / 无押金不再显示「未收取」以免误读，改为类型徽标
+      const depBadge = alipayFree
+        ? '<span class="badge is-accent">支付宝免押</span>'
+        : (noDeposit
+            ? '<span class="badge is-idle">无押金</span>'
+            : '<span class="badge ' + depTone + '">' + Utils.esc(depStatus) + '</span>');
+
+      const depositCell = ((hasDeposit && !noDeposit)
+          ? '<span class="num">' + Utils.money(s.depositAmount) + '</span>'
+          : '<span class="muted">—</span>')
+        + '<span class="cell-sub">' + depBadge + '</span>';
+
+      // 应收租金（合同口径）
+      const rentCell = (s.rentIncome !== '' && s.rentIncome != null)
+        ? '<span class="num">' + Utils.money(s.rentIncome) + '</span>'
+        : '<span class="muted">—</span>';
+
+      // 结算（回款口径）：已归还行展示实收金额，应收与实收不一致时标注差额
+      const settle = Service.settlementOf(s);
+      let settleCell;
+
+      if (settle && settle.hasActual) {
+        const extras = [];
+        if (settle.refund) extras.push('退 ' + Utils.money(settle.refund));
+        if (settle.deduct) extras.push('扣 ' + Utils.money(settle.deduct));
+
+        settleCell = '<span class="num">' + Utils.money(settle.actual) + '</span>'
+          + (extras.length ? '<span class="cell-sub">' + extras.join(' · ') + '</span>' : '')
+          + (settle.hasDue && settle.diff !== 0
+              ? '<span class="cell-sub is-warn">差额 ' +
+                (settle.diff > 0 ? '+' : '−') + Utils.money(Math.abs(settle.diff)) + '</span>'
+              : '');
+      } else if (settle) {
+        // 只填了退款 / 扣款 / 备注，没填实收
+        const extras = [];
+        if (settle.refund) extras.push('退 ' + Utils.money(settle.refund));
+        if (settle.deduct) extras.push('扣 ' + Utils.money(settle.deduct));
+        settleCell = '<span class="muted">未登记实收</span>'
+          + (extras.length ? '<span class="cell-sub">' + extras.join(' · ') + '</span>' : '');
+      } else {
+        settleCell = isReturned
+          ? '<span class="muted">未结算</span>'
+          : '<span class="muted">—</span>';
+      }
+
+      // 实际收回：未登记 = 日期输入 + 「登记收回」（弹层内一次填完结算，不用二次编辑）
+      //           已登记 = 日期 + 「结算/改结算」+「撤销」
+      // 默认填今天；下限为领用起始日，不设上限（支持补登历史归还）
+      const returnDefault = Utils.today() < s.startDate ? s.startDate : Utils.today();
+      const returnCell = isReturned
+        ? '<div class="inline">'
+            + '<span class="num">' + Utils.esc(s.returnedDate) + '</span>'
+            + '<button class="btn btn-link" type="button" data-action="open-settle" data-id="' + s.id + '">'
+            +   (settle ? '改结算' : '结算') + '</button>'
+            + '<button class="btn btn-link" type="button" data-action="clear-return" data-id="' + s.id + '">撤销</button>'
+          + '</div>'
+        : '<div class="inline">'
+            + '<input class="input" type="date" aria-label="实际收回日期"'
+            +   ' data-return-input="' + s.id + '" value="' + returnDefault + '"'
+            +   ' min="' + Utils.esc(s.startDate) + '" />'
+            + '<button class="btn btn-sm" type="button" data-action="open-settle" data-id="' + s.id + '">登记收回</button>'
+          + '</div>';
+
+      // 操作：明细展开 + 删除（带二次确认）
+      const actionsCell = '<div class="row-actions">'
+        + '<button class="btn btn-ghost btn-sm" type="button" data-action="toggle-detail" data-id="' + s.id + '"'
+        +   ' aria-expanded="' + (expanded ? 'true' : 'false') + '">' + (expanded ? '收起' : '明细') + '</button>'
+        + '<button class="btn btn-ghost btn-sm btn-danger-ghost" type="button"'
+        +   ' data-action="delete-schedule" data-id="' + s.id + '">删除</button>'
+        + '</div>';
+
+      const rowClass = overdue ? 'row-overdue' : (isReturned ? 'row-done' : '');
+
+      return ''
+        + '<tr class="' + rowClass + '">'
+        +   '<td>' + camCell + '</td>'
+        +   '<td>' + Utils.esc(s.userName) + '</td>'
+        +   '<td class="num">' + Utils.esc(s.startDate) + '</td>'
+        +   '<td>' + dueCell + '</td>'
+        +   '<td><span class="badge ' + state.tone + '">' + state.label + '</span></td>'
+        +   '<td>' + deliveryCell + '</td>'
+        +   '<td>' + depositCell + '</td>'
+        +   '<td>' + rentCell + '</td>'
+        +   '<td>' + settleCell + '</td>'
+        +   '<td>' + returnCell + '</td>'
+        +   '<td>' + actionsCell + '</td>'
+        + '</tr>'
+        + (expanded ? View.detailRow(s) : '');
+    }).join('');
+  },
+
+  /**
+   * 档期明细展开行：集中展示租赁费用、证件（脱敏）、备注等扩展字段
+   * EXT-7 追加新字段后，在此加一行 [标签, 值] 即可显示
+   */
+  detailRow(s) {
+    const rent = Number(s.rentIncome) || 0;
+    const cost = Number(s.costExpense) || 0;
+    const hasMoney = (s.rentIncome !== '' && s.rentIncome != null) ||
+                     (s.costExpense !== '' && s.costExpense != null);
+
+    const depType = s.depositType || CONFIG.DEPOSIT_TYPES[0];
+    const depStatusText = depType === CONFIG.DEPOSIT_TYPES[2]
+      ? '无需收取'
+      : (s.depositStatus || CONFIG.DEPOSIT_STATUS[0]);
+
+    const settle = Service.settlementOf(s);
+
+    const items = [
+      ['押金类型', depType, false],
+      ['押金金额', (s.depositAmount !== '' && s.depositAmount != null) ? Utils.money(s.depositAmount) : '未填写', true],
+      ['押金状态', depStatusText, false],
+      ['证件抵押', s.idProofType || CONFIG.ID_PROOF_TYPES[0], false],
+      ['证件号码', s.idProofNumber ? Utils.maskId(s.idProofNumber) : '—', false],
+      ['应收租金', (s.rentIncome !== '' && s.rentIncome != null) ? Utils.money(s.rentIncome) : '未填写', true],
+      ['成本支出', (s.costExpense !== '' && s.costExpense != null) ? Utils.money(s.costExpense) : '未填写', true],
+      ['净收益', hasMoney ? Utils.money(rent - cost) : '—', true],
+      // —— v5 结算信息 ——
+      ['实际收回', s.returnedDate || '未收回', false],
+      ['实收租金', (settle && settle.hasActual) ? Utils.money(settle.actual) : '未填写', true],
+      ['退款金额', (settle && settle.hasRefund) ? Utils.money(settle.refund) : '未填写', true],
+      ['扣款金额', (settle && settle.hasDeduct) ? Utils.money(settle.deduct) : '未填写', true],
+      ['结算净额（实收−退款+扣款）', settle ? Utils.money(settle.net) : '—', true],
+      ['登记时间', Utils.dateFromTs(s.createdAt), false],
+      ['档期备注', s.remark || '—', false, true],
+      ['结算备注', s.settlementRemark || '—', false, true]
+    ];
+
+    const html = items.map(item => {
+      const label = item[0], value = item[1], isNum = item[2], full = item[3];
+      return '<div class="detail-item"' + (full ? ' style="grid-column:1/-1"' : '') + '>'
+        + '<dt>' + Utils.esc(label) + '</dt>'
+        + '<dd class="' + (isNum ? 'num' : '') + '">' + Utils.esc(value) + '</dd>'
+        + '</div>';
+    }).join('');
+
+    return '<tr class="detail-row"><td colspan="11"><dl class="detail-grid">' + html + '</dl></td></tr>';
+  },
+
+  /* ---------------- 相机下拉选项（按所选时段实时判定可用性） ---------------- */
+  /**
+   * ★ 双重校验的第一道：实时联动
+   *   · 与所选时段冲突的相机（存在未登记收回的档期）→ option 置灰 disabled，
+   *     文案后标注「该时段已借出」，鼠标悬停可看到占用人，无法被选中
+   *   · 全部冲突时给出占位提示，引导调整日期
+   *   · 改日期后若原选择变为冲突 → 自动清空选择，强制重新挑选，
+   *     避免「下拉里看着还是一台、提交却落到冲突设备上」
+   */
+  renderCameraOptions() {
+    const cameras = Service.listCameras();
+    const sel = View.el.selCamera;
+    const prev = sel.value;
+
+    const start = View.el.inputStart ? View.el.inputStart.value : '';
+    const due = View.el.inputDue ? View.el.inputDue.value : '';
+    const rangeReady = !!(start && due && due >= start);
+
+    if (!cameras.length) {
+      sel.innerHTML = '<option value="">暂无相机，请先登记设备</option>';
+      sel.disabled = true;
+      View.el.btnAddSchedule.disabled = true;
+      View.el.hintScheduleForm.textContent = '请先在「设备管理」中登记相机设备';
+      View.el.hintScheduleForm.style.color = 'var(--danger)';
+      return;
+    }
+
+    sel.disabled = false;
+    View.el.btnAddSchedule.disabled = false;
+    View.el.hintScheduleForm.style.color = '';
+    View.el.hintScheduleForm.textContent = '选择相机并登记领用人与归还计划';
+
+    const items = cameras.map(c => {
+      const conflict = rangeReady ? Service.findConflict(c.id, start, due) : null;
+      const active = Service.activeScheduleOf(c.id);
+      const blocked = !!conflict;
+
+      // 冲突 → 「该时段已借出」；仅当前在借但时段不冲突（补录更早的历史）→ 「借出中」
+      const suffix = blocked ? '（该时段已借出）' : (active ? '（借出中）' : '');
+      const title = blocked
+        ? Service.conflictText(conflict)
+        : (active ? '该相机仍有未登记实际收回的档期' : '');
+
+      return {
+        id: c.id,
+        blocked,
+        html: '<option value="' + c.id + '"'
+          + (blocked ? ' disabled' : '')
+          + (title ? ' title="' + Utils.esc(title) + '"' : '')
+          + '>' + Utils.esc(c.model + ' · ' + c.serial + suffix) + '</option>'
+      };
+    });
+
+    const available = items.filter(i => !i.blocked).length;
+    const blockedCount = cameras.length - available;
+
+    sel.innerHTML = (available
+        ? '<option value="">请选择相机（' + available + ' 台可用' +
+          (blockedCount ? ' / ' + blockedCount + ' 台该时段已借出' : '') + '）</option>'
+        : '<option value="">该时段所有相机均已借出，请调整日期</option>')
+      + items.map(i => i.html).join('');
+
+    // 保留原选择；原选择已冲突则清空，确保「冲突相机不可能处于选中状态」
+    if (prev && items.some(i => i.id === prev && !i.blocked)) {
+      sel.value = prev;
+    } else {
+      sel.value = '';
+    }
+  },
+
+  /* ---------------- 可用性实时提示（与相机下拉联动） ---------------- */
+  renderAvailabilityHint() {
+    const hint = View.el.conflictHint;
+    if (!hint) return;
+
+    const clear = () => { hint.textContent = ''; hint.className = 'form-hint'; };
+
+    const start = View.el.inputStart ? View.el.inputStart.value : '';
+    const due = View.el.inputDue ? View.el.inputDue.value : '';
+    if (!start || !due) return clear();
+
+    if (due < start) {
+      hint.textContent = '预计归还日期不能早于领用起始日期';
+      hint.className = 'form-hint is-error';
+      return;
+    }
+
+    const cameras = Service.listCameras();
+    if (!cameras.length) return clear();
+
+    const blockedCount = cameras.filter(c => Service.findConflict(c.id, start, due)).length;
+    const free = cameras.length - blockedCount;
+    const cameraId = View.el.selCamera.value;
+
+    if (!cameraId) {
+      if (!free) {
+        hint.textContent = '该时段所有相机均已借出（未登记收回的相机会持续占用），请调整领用或归还日期';
+        hint.className = 'form-hint is-error';
+        return;
+      }
+      hint.textContent = '该时段有 ' + free + ' 台相机可租用' +
+        (blockedCount ? '，' + blockedCount + ' 台已借出并在下拉中置灰' : '') + '，请选择相机';
+      hint.className = 'form-hint';
+      return;
+    }
+
+    const conflict = Service.findConflict(cameraId, start, due);
+    if (conflict) {
+      const cam = Service.getCamera(cameraId);
+      hint.textContent = (cam ? cam.model + ' ' : '') + Service.conflictText(conflict) + '，请改选其他相机';
+      hint.className = 'form-hint is-error';
+      return;
+    }
+
+    const cam = Service.getCamera(cameraId);
+    hint.textContent = start + ' 至 ' + due + ' ' + (cam ? cam.model : '该相机') + ' 可租用，无时间冲突';
+    hint.className = 'form-hint is-ok';
+  },
+
+  /* ---------------- 结算弹层：登记收回 ---------------- */
+  /** 打开弹层：把日期与已有结算值一并带入，一次填完即可 */
+  openSettle(id) {
+    const s = Service.getSchedule(id);
+    if (!s) return View.toast('档期记录不存在', 'error');
+
+    const cam = Service.getCamera(s.cameraId);
+    const hasSettle = !!Service.settlementOf(s);
+
+    View.settle.id = id;
+    View.el.settleTitle.textContent = s.returnedDate
+      ? (hasSettle ? '修改结算信息' : '补充结算信息')
+      : '登记收回 · 结算';
+    View.el.settleSub.textContent = s.userName + ' · ' +
+      (cam ? cam.model + ' · ' + cam.serial : '相机已移除');
+
+    // 收回日期：已有则沿用；否则优先取行内日期框的值；兜底今天（且不早于领用日）
+    const inlineEl = document.querySelector('[data-return-input="' + id + '"]');
+    const fallback = Utils.today() < s.startDate ? s.startDate : Utils.today();
+
+    View.el.settleDate.min = s.startDate;
+    View.el.settleDate.value = s.returnedDate || (inlineEl && inlineEl.value) || fallback;
+
+    // 实收租金：已有则沿用；首次登记默认等于应收（提前归还时直接改小即可）
+    View.el.settleActual.value = (s.actualRent !== '' && s.actualRent != null)
+      ? s.actualRent
+      : ((s.rentIncome !== '' && s.rentIncome != null) ? s.rentIncome : '');
+    View.el.settleRefund.value = (s.refundAmount !== '' && s.refundAmount != null) ? s.refundAmount : '';
+    View.el.settleDeduct.value = (s.deductAmount !== '' && s.deductAmount != null) ? s.deductAmount : '';
+    View.el.settleRemark.value = s.settlementRemark || '';
+
+    View.setFormMessage(View.el.msgSettle, '', false);
+    View.renderSettleSummary(s);
+    View.renderSettleHint();
+
+    View.el.modalSettle.classList.remove('hidden');
+    document.body.style.overflow = 'hidden';
+
+    // 焦点落到日期框：键盘用户可改完日期直接 Tab 到金额
+    setTimeout(() => {
+      try { View.el.settleDate.focus({ preventScroll: true }); } catch (e) { /* 忽略 */ }
+    }, 30);
+  },
+
+  closeSettle() {
+    View.el.modalSettle.classList.add('hidden');
+    document.body.style.overflow = '';
+    View.settle.id = null;
+  },
+
+  /** 弹层顶部速览：使用人 / 租期 / 应收 / 押金，确认对象不弄错 */
+  renderSettleSummary(s) {
+    const rentText = (s.rentIncome !== '' && s.rentIncome != null)
+      ? Utils.money(s.rentIncome) : '未填写';
+
+    const depType = s.depositType || CONFIG.DEPOSIT_TYPES[0];
+    const depText = depType === CONFIG.DEPOSIT_TYPES[2]
+      ? '无押金'
+      : depType + ((s.depositAmount !== '' && s.depositAmount != null)
+          ? ' ' + Utils.money(s.depositAmount) : '');
+
+    const items = [
+      ['使用人', s.userName],
+      ['租期', s.startDate + ' → ' + s.dueDate],
+      ['应收租金', rentText],
+      ['押金', depText]
+    ];
+
+    View.el.settleSummary.innerHTML = items.map(i =>
+      '<div><dt>' + Utils.esc(i[0]) + '</dt><dd>' + Utils.esc(i[1]) + '</dd></div>'
+    ).join('');
+  },
+
+  /**
+   * 弹层提示 + 提前归还引导
+   *   收回日期 < 预计归还日 → 判定提前归还，提示可登记退款，
+   *   并给出「应收 − 实收」差额的一键填入按钮，高亮退款字段引导记账
+   */
+  renderSettleHint() {
+    const hint = View.el.settleHint;
+    const s = Service.getSchedule(View.settle.id);
+    if (!hint || !s) return;
+
+    const date = View.el.settleDate.value;
+    const guide = (on) => {
+      if (View.el.fieldRefund) View.el.fieldRefund.classList.toggle('is-guide', !!on);
+      if (View.el.settleRefund) View.el.settleRefund.classList.toggle('is-guide', !!on);
+    };
+
+    if (!date) {
+      hint.className = 'form-hint';
+      hint.textContent = '请选择实际收回日期（默认今天，可补登历史归还）';
+      guide(false);
+      return;
+    }
+
+    if (date < s.startDate) {
+      hint.className = 'form-hint is-error';
+      hint.textContent = '收回日期不能早于领用起始日期 ' + s.startDate;
+      guide(false);
+      return;
+    }
+
+    // 未提前（按时或逾期）归还
+    if (date >= s.dueDate) {
+      hint.className = 'form-hint';
+      hint.textContent = date > s.dueDate
+        ? '晚于预计归还日 ' + s.dueDate + ' 收回，如有逾期扣款请填入「扣款金额」。'
+        : '按实际收取情况填写结算；没有结算内容可留空，仅登记收回日期。';
+      guide(false);
+      return;
+    }
+
+    // 提前归还
+    const earlyDays = Math.round(
+      (new Date(s.dueDate + 'T00:00:00').getTime() - new Date(date + 'T00:00:00').getTime()) / 86400000
+    );
+    const due = Number(s.rentIncome) || 0;
+    const actual = Number(View.el.settleActual.value) || 0;
+    const gap = Math.round((due - actual) * 100) / 100;
+
+    let html = '提前 ' + earlyDays + ' 天归还（预计 ' + s.dueDate + '）。' +
+               '实收租金可小于应收，未使用部分的退款请记入「退款金额」，便于对账。';
+
+    if (gap > 0) {
+      html += '<button class="hint-action" type="button" data-action="fill-refund">' +
+              '按差额填入 ' + Utils.esc(Utils.money(gap)) + '</button>';
+    }
+
+    // 只要是提前归还就高亮退款字段：引导记账，而不是等用户自己想起来
+    guide(true);
+
+    hint.className = 'form-hint is-ok';
+    hint.innerHTML = html;
+  },
+
+  /** 通用空状态行 */
+  emptyRow(colspan, title, desc) {
+    return ''
+      + '<tr><td colspan="' + colspan + '">'
+      +   '<div class="empty">'
+      +     '<div class="empty-icon" aria-hidden="true">'
+      +       '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">'
+      +         '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18M8 15h4"/>'
+      +       '</svg>'
+      +     '</div>'
+      +     '<h3>' + Utils.esc(title) + '</h3>'
+      +     '<p>' + Utils.esc(desc) + '</p>'
+      +   '</div>'
+      + '</td></tr>';
+  },
+
+  /* ---------------- 轻提示 ---------------- */
+  toast(message, type) {
+    const node = document.createElement('div');
+    node.className = 'toast' + (type === 'error' ? ' is-error' : '');
+    node.textContent = message;
+    View.el.toastHost.appendChild(node);
+
+    setTimeout(() => {
+      node.style.transition = 'opacity .2s ease, transform .2s ease';
+      node.style.opacity = '0';
+      node.style.transform = 'translateY(4px)';
+      setTimeout(() => node.remove(), 220);
+    }, 2400);
+  },
+
+  /* ---------------- 表单提示 ---------------- */
+  setFormMessage(el, text, isError) {
+    el.textContent = text || '';
+    el.classList.toggle('is-error', !!isError);
+  }
+};
+
+/* ============================================================================
+ * 10. App —— 启动与事件绑定
+ * ==========================================================================*/
+const App = {
+  init() {
+    // ① 先用本地缓存渲染首屏：离线、或云端响应慢时页面也能立刻可用
+    Service.data = Store.load();
+
+    // 初始化「送达状态」下拉
+    View.el.selDelivery.innerHTML = CONFIG.DELIVERY_STATUS
+      .map(v => '<option value="' + Utils.esc(v) + '">' + Utils.esc(v) + '</option>')
+      .join('');
+
+    // 初始化租赁相关下拉（第一项即为默认值，form.reset() 后自动回落）
+    View.el.selDepositType.innerHTML = CONFIG.DEPOSIT_TYPES
+      .map(v => '<option value="' + Utils.esc(v) + '">' + Utils.esc(v) + '</option>')
+      .join('');
+
+    View.el.selDepositStatus.innerHTML = CONFIG.DEPOSIT_STATUS
+      .map(v => '<option value="' + Utils.esc(v) + '">' + Utils.esc(v) + '</option>')
+      .join('');
+
+    View.el.selIdType.innerHTML = CONFIG.ID_PROOF_TYPES
+      .map(v => '<option value="' + Utils.esc(v) + '">' + Utils.esc(v) + '</option>')
+      .join('');
+
+    App.initDateDefaults();
+    App.bindEvents();
+    View.renderAll();
+    App.syncIdNumberState();
+    App.syncDepositState();
+    View.renderAvailabilityHint();
+
+    // ② 再启动云端同步：未填写配置时 Sync.init 只更新角落标识，行为与 v1.0 一致
+    Sync.init();
+  },
+
+  /** 日期默认值：起始=今天，预计归还=7 天后 */
+  initDateDefaults() {
+    const today = Utils.today();
+    View.el.inputStart.value = today;
+    View.el.inputDue.value = Utils.addDays(today, 7);
+    View.el.inputStart.max = '';           // 允许补录历史档期
+    View.el.inputDue.min = today;
+  },
+
+  bindEvents() {
+    /* ---- 顶部导航切换 ---- */
+    document.querySelectorAll('.tab').forEach(tab => {
+      tab.addEventListener('click', () => App.switchTab(tab.dataset.tab));
+    });
+
+    /* ---- 设备表单提交 ---- */
+    View.el.formCamera.addEventListener('submit', e => {
+      e.preventDefault();
+      const fd = new FormData(View.el.formCamera);
+      const result = Service.addCamera({
+        model: fd.get('model'),
+        serial: fd.get('serial')
+      });
+
+      if (!result.ok) {
+        View.setFormMessage(View.el.msgCamera, result.error, true);
+        View.toast(result.error, 'error');
+        return;
+      }
+
+      View.setFormMessage(View.el.msgCamera, '已添加：' + result.camera.model, false);
+      View.el.formCamera.reset();
+      View.renderAll();
+      View.toast('设备已添加');
+    });
+
+    /* ---- 起始日期变化时，同步预计归还的最小值 ---- */
+    View.el.inputStart.addEventListener('change', () => {
+      const start = View.el.inputStart.value;
+      if (!start) return;
+      View.el.inputDue.min = start;
+      if (!View.el.inputDue.value || View.el.inputDue.value < start) {
+        View.el.inputDue.value = Utils.addDays(start, 7);
+      }
+      App.refreshAvailability();   // 日期变了：重算相机可用性
+    });
+
+    /* ---- 档期表单提交 ---- */
+    View.el.formSchedule.addEventListener('submit', e => {
+      e.preventDefault();
+      const fd = new FormData(View.el.formSchedule);
+      const result = Service.addSchedule({
+        cameraId: fd.get('cameraId'),
+        userName: fd.get('userName'),
+        startDate: fd.get('startDate'),
+        dueDate: fd.get('dueDate'),
+        deliveryStatus: fd.get('deliveryStatus'),
+        // 租赁业务字段
+        depositType: fd.get('depositType'),
+        depositAmount: fd.get('depositAmount'),
+        depositStatus: fd.get('depositStatus'),
+        idProofType: fd.get('idProofType'),
+        idProofNumber: fd.get('idProofNumber'),
+        rentIncome: fd.get('rentIncome'),
+        costExpense: fd.get('costExpense'),
+        remark: fd.get('remark')
+      });
+
+      if (!result.ok) {
+        // ★ 第二道闸门触发：提交时再次校验仍冲突 → 红字报错 + 展示冲突详情，拒绝写入
+        App.refreshAvailability();
+        View.setFormMessage(View.el.msgSchedule, result.error, true);
+
+        if (result.conflict && View.el.conflictHint) {
+          View.el.conflictHint.textContent = '已拦截：' +
+            Service.conflictText(result.conflict, (result.conflicts || []).length);
+          View.el.conflictHint.className = 'form-hint is-error';
+        }
+
+        View.toast(result.error, 'error');
+        return;
+      }
+
+      View.setFormMessage(View.el.msgSchedule, '已为 ' + result.schedule.userName + ' 登记档期', false);
+      View.el.formSchedule.reset();
+      App.initDateDefaults();
+      App.syncIdNumberState();
+      App.syncDepositState();
+      View.renderAll();
+      View.renderAvailabilityHint();
+      View.toast('档期已添加');
+    });
+
+    /* ---- 证件抵押类型变化：无抵押时禁用号码输入并清空 ---- */
+    View.el.selIdType.addEventListener('change', () => {
+      App.syncIdNumberState();
+      if (View.el.selIdType.value === CONFIG.ID_PROOF_TYPES[0]) View.el.inputIdNum.value = '';
+    });
+
+    /* ---- 押金类型变化：免押 / 无押金 联动金额与状态 ---- */
+    View.el.selDepositType.addEventListener('change', () => App.syncDepositState());
+
+    /* ---- 可用性联动：相机 / 起始日 / 归还日任一项变化即重算（下拉置灰 + 弱提示） ---- */
+    [View.el.selCamera, View.el.inputStart, View.el.inputDue].forEach(el => {
+      el.addEventListener('change', () => App.refreshAvailability());
+    });
+
+    // 日期用键盘逐段输入时，change 要等失焦才触发；补 input 监听让置灰即时生效
+    [View.el.inputStart, View.el.inputDue].forEach(el => {
+      el.addEventListener('input', () => App.refreshAvailability());
+    });
+
+    /* ---- 表格内操作（事件委托，新增行无需重复绑定） ---- */
+    document.addEventListener('click', e => {
+      const btn = e.target.closest('[data-action]');
+      if (!btn) return;
+
+      const id = btn.dataset.id;
+      const action = btn.dataset.action;
+
+      /* ---- 结算弹层（与表格操作共用同一个事件委托） ---- */
+      if (action === 'close-settle') {
+        View.closeSettle();
+        return;
+      }
+
+      if (action === 'open-settle') {
+        View.openSettle(id);
+        return;
+      }
+
+      // 提前归还时「按差额填入退款」= 应收 − 实收
+      if (action === 'fill-refund') {
+        const s = Service.getSchedule(View.settle.id);
+        if (!s) return;
+        const gap = Math.round(
+          ((Number(s.rentIncome) || 0) - (Number(View.el.settleActual.value) || 0)) * 100
+        ) / 100;
+        if (gap > 0) View.el.settleRefund.value = gap;
+        View.renderSettleHint();
+        return;
+      }
+
+      if (action === 'toggle-delivery') {
+        const r = Service.toggleDelivery(id);
+        if (!r.ok) return View.toast(r.error, 'error');
+        View.renderAll();
+        View.toast('送达状态已更新为「' + r.deliveryStatus + '」');
+        return;
+      }
+
+      if (action === 'clear-return') {
+        const r = Service.clearReturnedDate(id);
+        if (!r.ok) return View.toast(r.error, 'error');
+        View.renderAll();
+        View.toast('已撤销收回登记，该相机恢复为「借出中」');
+        return;
+      }
+
+      if (action === 'toggle-detail') {
+        if (View.expanded.has(id)) View.expanded.delete(id);
+        else View.expanded.add(id);
+        View.renderSchedules();
+        return;
+      }
+
+      if (action === 'delete-schedule') {
+        const record = Service.getSchedule(id);
+        if (!record) return View.toast('档期记录不存在', 'error');
+        const cam = Service.getCamera(record.cameraId);
+
+        const okDelete = window.confirm(
+          '确认删除这条档期记录？\n\n' +
+          '相机：' + (cam ? cam.model + ' · ' + cam.serial : '已移除的设备') + '\n' +
+          '使用人：' + record.userName + '\n' +
+          '档期：' + record.startDate + ' 至 ' + record.dueDate + '\n\n' +
+          '删除后不可恢复。'
+        );
+        if (!okDelete) return;
+
+        const removed = Service.deleteSchedule(id);
+        if (!removed.ok) return View.toast(removed.error, 'error');
+
+        View.expanded.delete(id);
+        View.renderAll();
+        View.renderAvailabilityHint();
+        View.toast('档期记录已删除');
+        return;
+      }
+
+      if (action === 'delete-camera') {
+        const cam = Service.getCamera(id);
+        if (!cam) return View.toast('相机设备不存在', 'error');
+
+        // 有未完成档期：直接拦截，不进入确认弹窗
+        const unfinished = Service.data.schedules.filter(x => x.cameraId === id && !x.returnedDate);
+        if (unfinished.length) {
+          return View.toast('该设备还有 ' + unfinished.length + ' 条未完成档期，请先处理后再删除', 'error');
+        }
+
+        const history = Service.data.schedules.filter(x => x.cameraId === id).length;
+        const okDelete = window.confirm(
+          '确认删除该设备？\n\n' +
+          '相机：' + cam.model + '\n' +
+          '机身序列号：' + cam.serial +
+          (history ? '\n\n该设备有 ' + history + ' 条已完成的档期记录，删除设备后记录仍保留，但会显示「相机已移除」。' : '') +
+          '\n\n删除后不可恢复。'
+        );
+        if (!okDelete) return;
+
+        const removed = Service.deleteCamera(id);
+        if (!removed.ok) return View.toast(removed.error, 'error');
+
+        View.renderAll();
+        View.renderAvailabilityHint();
+        View.toast(removed.history ? '设备已删除，' + removed.history + ' 条历史档期已保留' : '设备已删除');
+        return;
+      }
+
+      // EXT-8 操作扩展：编辑、导出、批量操作等新动作在此追加 case
+    });
+
+    /* ---- 档期筛选栏：搜索 / 日期 / 相机 / 状态 可叠加 ---- */
+    View.el.filterSearch.addEventListener('input', () => {
+      View.filter.keyword = View.el.filterSearch.value;
+      View.renderSchedules();
+    });
+
+    View.el.filterDate.addEventListener('change', () => {
+      View.filter.date = View.el.filterDate.value;
+      View.renderSchedules();
+    });
+
+    View.el.filterCamera.addEventListener('change', () => {
+      View.filter.cameraModel = View.el.filterCamera.value;
+      View.renderSchedules();
+    });
+
+    View.el.filterStatus.addEventListener('change', () => {
+      View.filter.status = View.el.filterStatus.value;
+      View.renderSchedules();
+    });
+
+    View.el.filterReset.addEventListener('click', () => {
+      View.filter.keyword = '';
+      View.filter.date = '';
+      View.filter.cameraModel = '';
+      View.filter.status = '';
+      View.el.filterSearch.value = '';
+      View.el.filterDate.value = '';
+      View.el.filterCamera.value = '';
+      View.el.filterStatus.value = '';
+      View.renderSchedules();
+    });
+
+    /* ---- 结算弹层：提交 / 金额联动 / ESC 关闭 ---- */
+    View.el.formSettle.addEventListener('submit', e => {
+      e.preventDefault();
+
+      const id = View.settle.id;
+      if (!id) return View.closeSettle();
+
+      const r = Service.settleReturn(id, {
+        returnedDate: View.el.settleDate.value,
+        actualRent: View.el.settleActual.value,
+        refundAmount: View.el.settleRefund.value,
+        deductAmount: View.el.settleDeduct.value,
+        settlementRemark: View.el.settleRemark.value
+      });
+
+      if (!r.ok) {
+        View.setFormMessage(View.el.msgSettle, r.error, true);
+        return;
+      }
+
+      View.closeSettle();
+      View.renderAll();     // 收回后该相机的占用立即释放，下拉与提示同步刷新
+
+      const settled = Service.settlementOf(r.schedule);
+      const moneyText = (settled && settled.hasActual) ? '，实收 ' + Utils.money(settled.actual) : '';
+      View.toast((r.early ? '已提前收回（' : '已登记收回（') + r.schedule.returnedDate + '）' + moneyText);
+    });
+
+    // 日期 / 金额变化：实时重算「提前归还」提示与差额引导
+    [View.el.settleDate, View.el.settleActual, View.el.settleRefund, View.el.settleDeduct].forEach(el => {
+      el.addEventListener('input', () => View.renderSettleHint());
+      el.addEventListener('change', () => View.renderSettleHint());
+    });
+
+    // ESC 关闭弹层（键盘可达性）
+    document.addEventListener('keydown', e => {
+      if (e.key !== 'Escape') return;
+      if (View.el.modalSettle && !View.el.modalSettle.classList.contains('hidden')) {
+        View.closeSettle();
+      }
+    });
+
+    /* ---- 多标签页同步：其他标签页写入后刷新当前视图 ---- */
+    window.addEventListener('storage', e => {
+      if (e.key !== CONFIG.STORAGE_KEY) return;
+      // 云端模式下以云端为准，直接对齐一次；纯本地模式读缓存即可
+      if (Cloud.enabled) {
+        Sync.pull({ reason: 'visible' });
+        return;
+      }
+      Service.data = Store.load();
+      View.renderAll();
+    });
+  },
+
+  /**
+   * 可用性联动刷新（第一道校验的入口）
+   *   · 相机下拉：冲突设备置灰 + 标注「该时段已借出」，不允许选中
+   *   · 弱提示区：红字冲突详情 / 绿字可租用 / 提示调整日期
+   */
+  refreshAvailability() {
+    View.renderCameraOptions();
+    View.renderAvailabilityHint();
+  },
+
+  /** 兼容旧调用名（v4 及更早版本叫 updateConflictHint） */
+  updateConflictHint() {
+    View.renderAvailabilityHint();
+  },
+
+  /** 证件号码输入框随抵押类型联动启用/禁用 */
+  syncIdNumberState() {
+    const noProof = View.el.selIdType.value === CONFIG.ID_PROOF_TYPES[0];
+    View.el.inputIdNum.disabled = noProof;
+    View.el.inputIdNum.placeholder = noProof ? '选择证件类型后填写' : '填写抵押证件号码';
+  },
+
+  /**
+   * 押金类型联动（表单层，与 Service 里的规则保持一致）：
+   *   支付宝免押 → 状态自动置「已收取」，金额可填 0 或授权额度
+   *   无押金     → 金额锁定为 0，不可编辑
+   *   正常收押   → 金额恢复可编辑
+   */
+  syncDepositState() {
+    const type = View.el.selDepositType.value;
+    const amount = View.el.inputDeposit;
+    const status = View.el.selDepositStatus;
+
+    const isAlipay = type === CONFIG.DEPOSIT_TYPES[1];
+    const isNone = type === CONFIG.DEPOSIT_TYPES[2];
+
+    if (isNone) {
+      amount.value = '0';
+      amount.readOnly = true;
+      amount.dataset.autoZero = '1';     // 标记「由类型自动写入」，切回时清空
+      amount.placeholder = '无押金';
+    } else {
+      if (amount.dataset.autoZero === '1') amount.value = '';
+      amount.dataset.autoZero = '0';
+      amount.readOnly = false;
+      amount.placeholder = isAlipay ? '0 或免押授权额度' : '0.00';
+    }
+
+    // 免押无需人工确认收款，状态直接落到「已收取」
+    if (isAlipay) status.value = '已收取';
+    status.disabled = false;
+  },
+
+  /** 切换主视图 */
+  switchTab(name) {
+    document.querySelectorAll('.tab').forEach(t => {
+      t.setAttribute('aria-selected', String(t.dataset.tab === name));
+    });
+    document.getElementById('panel-cameras').classList.toggle('hidden', name !== 'cameras');
+    document.getElementById('panel-schedules').classList.toggle('hidden', name !== 'schedules');
+  }
+};
+
+document.addEventListener('DOMContentLoaded', App.init);
+</script>
+<!-- 访问口令门槛（手机网页版用，只防随手打开，不是真正权限控制） -->
+<div id="lockMask" style="display:none;position:fixed;inset:0;z-index:99999;background:#0f172a;color:#fff;align-items:center;justify-content:center;font-family:system-ui,-apple-system,'Microsoft YaHei',sans-serif">
+  <div style="width:320px;max-width:86vw;background:#1e293b;padding:22px;border-radius:14px;text-align:center;box-sizing:border-box">
+    <div style="font-size:16px;font-weight:600;margin-bottom:6px">相机档期管理</div>
+    <div style="font-size:12px;opacity:.7;margin-bottom:14px">请输入口令后进入</div>
+    <input id="lockInput" type="password" style="width:100%;padding:10px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#fff;font-size:16px;box-sizing:border-box" />
+    <div id="lockErr" style="color:#f87171;font-size:12px;height:16px;line-height:16px;margin:8px 0"></div>
+    <button id="lockBtn" style="width:100%;padding:10px;border:0;border-radius:8px;background:#0d9488;color:#fff;font-size:15px;cursor:pointer">进入</button>
+  </div>
+</div>
+<script>
+(function () {
+  var PASS = 'cam2026';
+  var KEY = 'camera-schedule:auth:v1';
+  var mask = document.getElementById('lockMask');
+  function authorized() { try { return localStorage.getItem(KEY) === '1'; } catch (e) { return false; } }
+  if (authorized()) return;
+  mask.style.display = 'flex';
+  document.body.style.overflow = 'hidden';
+  var input = document.getElementById('lockInput');
+  var err = document.getElementById('lockErr');
+  setTimeout(function () { try { input.focus(); } catch (e) {} }, 300);
+  function submit() {
+    if (String(input.value) === PASS) {
+      try { localStorage.setItem(KEY, '1'); } catch (e) {}
+      mask.style.display = 'none';
+      document.body.style.overflow = '';
+    } else {
+      err.textContent = '口令不对，请重试';
+      try { input.select(); } catch (e) {}
+    }
+  }
+  document.getElementById('lockBtn').addEventListener('click', submit);
+  input.addEventListener('keydown', function (e) { if (e.key === 'Enter') submit(); });
+})();
+</script>
+</body>
+</html>
+
+<!--
+################################################################################
+#  附：Supabase 极简接入说明（照着做 5 步即可，全程免费额度足够 2-5 人小团队）
+################################################################################
+
+【第 1 步】注册并新建项目
+  1. 打开 https://supabase.com 注册（可用 GitHub 账号，免费）。
+  2. 点 New project，填项目名（如 camera-schedule）、数据库密码、选一个离你近的区域。
+  3. 等待 1-2 分钟初始化完成。
+
+【第 2 步】建两张表（设备表 / 档期表，字段与页面完全对应）
+  进入左侧 SQL Editor → New query，粘贴下面整段 → 点 Run：
+
+  --------------------------------------------------------------------------
+  -- 设备表
+  create table if not exists public.cameras (
+    id          text primary key,
+    model       text not null,
+    serial      text not null,
+    created_at  bigint,
+    updated_at  timestamptz default now()
+  );
+
+  -- 档期表
+  create table if not exists public.schedules (
+    id               text primary key,
+    camera_id        text,
+    user_name        text,
+    start_date       date,
+    due_date         date,
+    delivery_status  text,
+    returned_date    text,          -- 未归还存空串，便于前端直接判断
+    -- 租赁业务字段（v2 新增，v4 增加押金类型）
+    deposit_type     text,          -- 正常收押 / 支付宝免押 / 无押金
+    deposit_amount   numeric(12,2), -- 押金金额，留空为 null；无押金为 0
+    deposit_status   text,          -- 未收取 / 已收取 / 已退还
+    id_proof_type    text,          -- 无抵押 / 身份证 / 学生证 / 其他证件
+    id_proof_number  text,          -- 证件号码（列表脱敏展示）
+    rent_income      numeric(12,2), -- 应收租金
+    cost_expense     numeric(12,2), -- 成本支出（快递费、耗材等）
+    remark           text,          -- 档期备注
+    -- 结算字段（v5 新增：登记收回时一次写入，用于提前归还 / 退款 / 扣款记账）
+    actual_rent      numeric(12,2), -- 实收租金
+    refund_amount    numeric(12,2), -- 退款金额
+    deduct_amount    numeric(12,2), -- 扣款金额（损坏、逾期等）
+    settlement_remark text,         -- 结算备注（提前归还原因、扣款明细等）
+    settled_at       bigint,        -- 结算登记时间戳，null = 未结算
+    created_at       bigint,
+    updated_at       timestamptz default now()
+  );
+
+  -- 若你之前已经建过 v1/v2/v3 的表，执行下面这段做增量升级（可重复执行，不会丢数据）
+  alter table public.schedules add column if not exists deposit_type     text;
+  alter table public.schedules add column if not exists deposit_amount   numeric(12,2);
+  alter table public.schedules add column if not exists deposit_status   text;
+  alter table public.schedules add column if not exists id_proof_type    text;
+  alter table public.schedules add column if not exists id_proof_number  text;
+  alter table public.schedules add column if not exists rent_income      numeric(12,2);
+  alter table public.schedules add column if not exists cost_expense     numeric(12,2);
+  alter table public.schedules add column if not exists remark           text;
+  -- v5 结算字段（已建过 v4 的表只需执行这 5 行）
+  alter table public.schedules add column if not exists actual_rent       numeric(12,2);
+  alter table public.schedules add column if not exists refund_amount     numeric(12,2);
+  alter table public.schedules add column if not exists deduct_amount     numeric(12,2);
+  alter table public.schedules add column if not exists settlement_remark text;
+  alter table public.schedules add column if not exists settled_at        bigint;
+
+  -- 开启行级安全，并给 anon 角色本表全部读写权限（团队共享密钥模式）
+  alter table public.cameras   enable row level security;
+  alter table public.schedules enable row level security;
+
+  drop policy if exists team_all_cameras   on public.cameras;
+  drop policy if exists team_all_schedules on public.schedules;
+
+  create policy team_all_cameras on public.cameras
+    for all to anon using (true) with check (true);
+
+  create policy team_all_schedules on public.schedules
+    for all to anon using (true) with check (true);
+  --------------------------------------------------------------------------
+
+【第 3 步】取两项配置
+  Project Settings（齿轮图标）→ API：
+    · Project URL          → 填到 CLOUD_CONFIG.SUPABASE_URL
+    · anon / public key    → 填到 CLOUD_CONFIG.SUPABASE_ANON_KEY（不是 service_role！）
+
+【第 4 步】填配置并分发
+  打开本文件，修改脚本顶部【云端配置填写处】的两行字符串，保存。
+  把这份 HTML 发给团队成员（微信/网盘均可），大家打开同一个文件、填同一组配置，
+  即可看到同一份设备与档期数据。
+
+【第 5 步】验证
+  打开页面，右上角出现绿点「云端已同步」即成功。
+  在 A 设备新增一台相机，B 设备最迟 4 秒内自动出现，无需刷新。
+
+----------------------------------------------------------------------------
+【同步机制说明】
+  · 首屏：先用 localStorage 缓存渲染 → 再拉云端覆盖（断网也能立即看）
+  · 写入：每次新增/修改 → 300ms 防抖合并 → upsert 到云端
+  · 监听：每 4 秒轮询一次 + 切回前台 / 网络恢复 / 手动点击状态标识时立即拉取
+    （改小 CLOUD_CONFIG.POLL_MS 可更实时，代价是请求更频繁）
+  · 离线：请求失败自动降级本地缓存，改动进入待推送队列（存 localStorage，刷新不丢），
+          联网后自动续传，再拉取云端合并
+  · 冲突：以云端为准；本地「尚未推送成功」的记录在拉取时保留，避免离线改动被覆盖
+
+【常见问题】
+  · 右上角显示「云端异常」：多半是没执行第 2 步 SQL（表不存在），或密钥填成了
+    service_role。鼠标悬停标识可看到具体错误信息。
+  · 显示「离线·本地缓存」：网络不通/被墙，先用本地，恢复后会自动补齐。
+  · 想让所有人都能删数据但别人不能删库：改用 Supabase Auth + 更细的 RLS 策略，
+    属于后续迭代，非本版本范围。
+  · 安全提示：anon key 是公开密钥，随文件分发意味着「拿到文件即可读写这张表」。
+    请只分享给团队内部，切勿公开发布到互联网；正式对外前应接入 Supabase Auth 登录。
+
+【EXT 扩展位一览（v5.0 全部保留，EXT-6 冲突校验已强化）】
+  EXT-1 新增主视图 tab            EXT-6 档期时间冲突校验（★ 已实现，v5 改为无限占用区间）
+  EXT-2 新增指标卡                EXT-7 档期字段扩展（★ v5 已追加结算类字段）
+  EXT-3 更换存储键 / 环境          EXT-8 新增行内操作（编辑、导出等）
+  EXT-4 本地数据版本迁移（★ 已用于 v1→v2、v2→v3、v3→v4 迁移）  EXT-9 删除同步（Cloud.remove 已就绪）
+  EXT-5 设备字段扩展              EXT-10 云端字段扩展（见 Mapper 层注释）
+                                 EXT-11 筛选扩展（CONFIG.SCHEDULE_FILTERS / 搜索条件）
+
+【租赁字段与数据库列的对应关系（v5.0）】
+  应用内字段           数据库列            类型              说明
+  depositType        deposit_type       text              正常收押 / 支付宝免押 / 无押金
+  depositAmount      deposit_amount     numeric(12,2)     押金金额，留空存 null；无押金固定 0
+  depositStatus      deposit_status     text              未收取 / 已收取 / 已退还（免押自动已收取）
+  idProofType        id_proof_type      text              无抵押 / 身份证 / 学生证 / 其他证件
+  idProofNumber      id_proof_number    text              证件号码，列表仅显示首尾
+  rentIncome         rent_income        numeric(12,2)     应收租金（合同口径）
+  costExpense        cost_expense       numeric(12,2)     成本支出（快递费、耗材等）
+  remark             remark             text              档期备注
+  actualRent         actual_rent        numeric(12,2)     实收租金（回款口径，登记收回时写入）
+  refundAmount       refund_amount      numeric(12,2)     退款金额（提前归还退还的费用）
+  deductAmount       deduct_amount      numeric(12,2)     扣款金额（损坏、逾期等）
+  settlementRemark   settlement_remark  text              结算备注（提前归还原因 / 扣款明细 / 退款说明）
+  settledAt          settled_at         bigint            结算登记时间戳，null = 未结算
+
+【关键业务规则（v3.0 起）】
+  · 已归还的档期不参与冲突校验，历史可自由补录
+  · 金额选填；填了必须是 ≥0 的数字，保存时四舍五入到分
+  · 选了证件抵押类型就必须填号码；切换回「无抵押」自动清空号码
+  · 删除设备：有未完成档期时直接拦截；仅有历史档期时允许删除，历史记录保留并显示「相机已移除」
+  · 删除同步：走 Sync 删除队列，离线删除不会被云端「复活」
+
+【v4.0 关键业务规则】
+  · 占用状态：只看「是否登记实际收回日期」。逾期不自动释放，必须人工登记收回才变空闲
+  · 收回日期：默认今天；下限 = 该档期领用起始日；不再限制「不能晚于今天」，可补登历史/未来归还
+  · 押金类型 - 支付宝免押：押金金额可填 0 或免押授权额度，押金状态自动记为「已收取」
+  · 押金类型 - 无押金：押金金额固定 0，不计入「待收押金总额」，列表显示「无押金」徽标
+  · 全局搜索：使用人 / 相机型号 / 机身序列号 模糊匹配（不区分大小写），输入即筛选
+  · 日期筛选：领用日 ≤ 所选日期 ≤ 归还日（已归还用实际收回日，未归还用预计归还日）
+  · 搜索 / 日期 / 相机型号 / 档期状态 四个条件叠加生效，点「重置」恢复全量列表
+
+【v5.0 关键业务规则（本次修复与新增）】
+  ★ 占用区间 = [领用起始日, +∞)
+      · 只要没登记「实际收回日期」，该相机就被视为一直占用，此后任何时段的新档期都算冲突
+      · 修复的 BUG：v4 用「有限区间」判定（newStart <= oldDue && newDue >= oldStart），
+        档期一旦逾期（应还日已过但相机没还），排在应还日之后的新档期会被判为不冲突，
+        导致同一台机器被重复排期
+      · 已登记实际收回的档期不参与判断，归还后当天即可再排下一档
+      · 新档期整体早于某条未归还档期的领用日时（补录更早的历史）不算冲突
+  ★ 双重强拦截
+      ① 实时联动：选完领用/归还日期后，相机下拉自动置灰冲突设备并标注「该时段已借出」
+         （disabled，不可选中；悬停可看占用人）；原选中项变为冲突时自动清空选择
+      ② 提交二次校验：Service.addSchedule 再次调用 findConflicts，冲突即拒绝写入，
+         报错含占用人 + 占用区间 + 「尚未登记实际收回」，并在表单下方红字展示
+  ★ 结算口径
+      实收租金 —— 实际收到的钱（提前归还时可小于应收）
+      退款金额 —— 退回去的钱
+      扣款金额 —— 额外扣收的钱（损坏、逾期等）
+      结算净额 = 实收 − 退款 + 扣款；差额 = 实收 − 应收（列表以琥珀色标注）
+  ★ 登记收回一次填完
+      列表「登记收回」打开弹层，日期 + 实收 + 退款 + 扣款 + 结算备注一并提交，无需二次编辑；
+      收回日期早于预计归还日 → 判定提前归还，提示可登记退款，并可按「应收 − 实收」一键填入差额
+  ★ 看板口径
+      累计应收租金 = Σ 应收租金（合同口径，含进行中）
+      累计实收租金 = Σ 实收租金（回款口径，仅统计已登记结算的档期）
+
+【EXT-10 云端字段扩展提示】
+  给 cameras / schedules 增列时，需同步改三处：建表 SQL、Mapper 的 toRow / fromRow、
+  以及 Service 里构造对象的字段。业务与渲染层无需改动。
+################################################################################
+-->
